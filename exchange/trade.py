@@ -1,9 +1,128 @@
 """CLI: python -m exchange.engine path/to/submission.tgz"""
-import argparse, importlib.util, time, tarfile, tempfile, sys, json, os
-import uuid
+import argparse
+import math
+import importlib
+import json
+import os
+import sys
+import tarfile
+import tempfile
+from collections import defaultdict
 from pathlib import Path
+
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
+
+try:
+    import optuna
+except Exception:
+    optuna = None
+
+# --- Constantes y Funciones Matemáticas (NUEVO) --------------------------
+MINUTES_PER_YEAR = 365 * 24 * 60
+ANNUALIZATION_FACTOR = np.sqrt(MINUTES_PER_YEAR)
+EPSILON = 1e-9
+DEFAULT_RISK_FREE = 0.0
+
+def sharpe(returns: np.ndarray, risk_free: float = DEFAULT_RISK_FREE):
+    if len(returns) == 0: return 0.0
+    excess = returns - risk_free / MINUTES_PER_YEAR
+    return ANNUALIZATION_FACTOR * excess.mean() / (excess.std(ddof=1) + EPSILON)
+
+def max_drawdown(equity: np.ndarray):
+    if len(equity) == 0: return 0.0
+    cummax = np.maximum.accumulate(equity)
+    dd = (equity - cummax) / cummax
+    return dd.min()
+
+def score_from_metrics(metrics: dict) -> tuple[float, dict[str, float]]:
+    """Compute Kaggle score and expose each component for reporting."""
+    if metrics.get("trade_count", 0) == 0:
+        return float("-inf"), {
+            "sharpe_contribution": 0.0,
+            "drawdown_penalty": 0.0,
+            "turnover_penalty": 0.0,
+        }
+    sharpe_component = 0.7 * metrics["sharpe"]
+    drawdown_component = 0.2 * abs(metrics["max_dd"])
+    turnover_component = 0.1 * (metrics["turnover"] / 1e6)
+    score = sharpe_component - drawdown_component - turnover_component
+    return score, {
+        "sharpe_contribution": sharpe_component,
+        "drawdown_penalty": drawdown_component,
+        "turnover_penalty": turnover_component,
+    }
+
+def _reload_strategy_module(submission_dir: Path):
+    """Reload strategy package from scratch to avoid cross-trial state bleed."""
+    submission_path = str(submission_dir)
+    if submission_path not in sys.path:
+        sys.path.insert(0, submission_path)
+
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == "strategy" or mod_name.startswith("strategy."):
+            del sys.modules[mod_name]
+
+    return importlib.import_module("strategy.main")
+
+
+_STRATEGY_MODULE_CACHE = {}
+
+
+def _get_strategy_module(submission_dir: Path):
+    """Get cached strategy module for a submission path."""
+    cache_key = str(submission_dir.resolve())
+    if cache_key not in _STRATEGY_MODULE_CACHE:
+        _STRATEGY_MODULE_CACHE[cache_key] = _reload_strategy_module(submission_dir)
+    return _STRATEGY_MODULE_CACHE[cache_key]
+
+
+def _flatten_numeric_params(obj, path=()):
+    """Flatten nested numeric params to {(path_tuple): value}."""
+    out = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out.update(_flatten_numeric_params(v, path + (str(k),)))
+    elif isinstance(obj, (int, float)) and not isinstance(obj, bool):
+        out[path] = obj
+    return out
+
+
+def _set_nested_value(dst, path, value):
+    cur = dst
+    for key in path[:-1]:
+        if key not in cur or not isinstance(cur[key], dict):
+            cur[key] = {}
+        cur = cur[key]
+    cur[path[-1]] = value
+
+
+def _suggest_from_default(trial, flat_key, default):
+    """Suggest a value around the default without hardcoding parameter names."""
+    name = "__".join(flat_key)
+
+    if isinstance(default, int):
+        low = max(1, int(round(default * 0.5)))
+        high = max(low + 1, int(round(default * 2.0)))
+        return int(trial.suggest_int(name, low, high))
+
+    val = float(default)
+    abs_val = abs(val)
+    if abs_val > 0 and abs_val < 1e-4:
+        low = max(abs_val * 0.1, 1e-12)
+        high = max(abs_val * 10.0, low * 10.0)
+        sampled = trial.suggest_float(name, low, high, log=True)
+    elif abs_val <= 1.0:
+        low = max(1e-9, abs_val * 0.25)
+        high = max(low * 1.5, min(1.0, abs_val * 4.0 if abs_val > 0 else 1.0))
+        sampled = trial.suggest_float(name, low, high)
+    else:
+        low = max(1e-9, abs_val * 0.5)
+        high = max(low * 1.5, abs_val * 2.0)
+        sampled = trial.suggest_float(name, low, high)
+
+    return sampled if val >= 0 else -sampled
 
 # --- Core Engine ---------------------------------------------------------
 
@@ -132,7 +251,13 @@ class Trader:
         if executed:
             self.trade_count += 1
 
-def run_backtest(submission_dir: Path, combined_data: pd.DataFrame, fee: float, balances: dict[str, float]) -> pd.DataFrame:
+def run_backtest(
+    submission_dir: Path,
+    combined_data: pd.DataFrame,
+    fee: float,
+    balances: dict[str, float],
+    strategy_params: dict | None = None,
+) -> tuple[pd.DataFrame, dict]:
     """Run a backtest with multiple trading pairs.
 
     Args:
@@ -141,8 +266,13 @@ def run_backtest(submission_dir: Path, combined_data: pd.DataFrame, fee: float, 
         fee: Trading fee (in basis points, e.g., 2 = 0.02%)
         balances: Dictionary of {pair: amount} containing initial balances
     """
-    sys.path.insert(0, str(submission_dir))
-    strat_mod = importlib.import_module("strategy.main")
+    strat_mod = _get_strategy_module(submission_dir)
+
+    if strategy_params and hasattr(strat_mod, "set_params"):
+        strat_mod.set_params(strategy_params)
+
+    if hasattr(strat_mod, "reset"):
+        strat_mod.reset()
 
     trader = Trader(balances, fee)
 
@@ -161,43 +291,63 @@ def run_backtest(submission_dir: Path, combined_data: pd.DataFrame, fee: float, 
         initial_portfolio_value += initial_balances["token_2"] * first_prices["token_2/fiat"]
 
     trader.equity_history = [initial_portfolio_value]
-    result = pd.DataFrame(
-        columns=["id", "timestamp", "pair", "side", "qty"],
-    )
 
-    # Process data timestamp by timestamp
-    groups = combined_data.groupby('timestamp')
-    try:
-        total_groups = int(combined_data['timestamp'].nunique())
-    except Exception:
-        total_groups = None
+    # Build a timestamp -> {pair -> row} index in one vectorized pass.
+    rows_by_ts = defaultdict(dict)
+    for rec in combined_data.to_dict("records"):
+        rows_by_ts[rec["timestamp"]][rec["symbol"]] = rec
 
-    for timestamp, group in tqdm(groups, total=total_groups, desc="Backtest"):
-        # Update prices for each pair in this timestamp
-        market_data = {
-            "fee": fee
-        }
-        for _, row in group.iterrows():
-            pair = row['symbol']
-            data_dict = row.to_dict()
-            # Add fee information to market data so strategies can access it
-            market_data[pair] = data_dict
-            trader.update_market(pair, data_dict)
+    timestamps = sorted(rows_by_ts)
+    all_actions = []
+    trade_id_counter = 0
+
+    for timestamp in tqdm(timestamps, desc="Backtest"):
+        market_data = {"fee": fee}
+        for pair, row_dict in rows_by_ts[timestamp].items():
+            market_data[pair] = row_dict
+            trader.update_market(pair, row_dict)
 
         # Get strategy decision based on all available market data and current balances
-        actions: list[dict] | None = strat_mod.on_data(market_data, balances)
-
+        actions = strat_mod.on_data(market_data, balances)
         if actions is None:
             continue
 
-        # Add action dictionary to result DataFrame
+        # Avoid per-row DataFrame concat; collect and build once at the end.
         for action in actions:
             trader.execute(action)
-            action["timestamp"] = timestamp
-            action["id"] = str(uuid.uuid4())
-            result = pd.concat([result, pd.DataFrame([action])], ignore_index=True)
+            trade_id_counter += 1
+            all_actions.append({
+                "id": str(trade_id_counter),
+                "timestamp": timestamp,
+                "pair": action["pair"],
+                "side": action["side"],
+                "qty": action["qty"],
+            })
 
-    return result
+    result = pd.DataFrame(all_actions, columns=["id", "timestamp", "pair", "side", "qty"])
+
+    # --- CÁLCULO DE MÉTRICAS AL FINALIZAR EL BUCLE (NUEVO) ---
+    equity_curve = np.array(trader.equity_history)
+    rets = np.diff(equity_curve) / equity_curve[:-1] if len(equity_curve) > 1 else np.array([])
+    
+    initial_equity = equity_curve[0] if len(equity_curve) > 0 else 0.0
+    final_equity = equity_curve[-1] if len(equity_curve) > 0 else 0.0
+    absolute_pnl = final_equity - initial_equity
+    percentage_pnl = (absolute_pnl / initial_equity) * 100 if initial_equity > 0 else 0.0
+
+    metrics = {
+        "sharpe": sharpe(rets),
+        "max_dd": max_drawdown(equity_curve),
+        "turnover": trader.turnover,
+        "absolute_pnl": absolute_pnl,
+        "percentage_pnl": percentage_pnl,
+        "initial_equity": initial_equity,
+        "final_equity": final_equity,
+        "trade_count": trader.trade_count,
+        "total_fees_paid": trader.total_fees_paid,
+    }
+
+    return result, metrics
 
 
 # --- CLI --------------------------------------------------------------
@@ -208,20 +358,139 @@ def main(args: argparse.Namespace):
         sys.exit(1)
 
     data_df = pd.read_csv(args.data)
+    base_balances = {
+        "fiat": args.fiat_balance,
+        "token_1": args.token1_balance,
+        "token_2": args.token2_balance,
+    }
+
+    data_dir = Path(args.data).parent
+    params_file = data_dir / "best_params.json"
 
     with tempfile.TemporaryDirectory() as td:
         with tarfile.open(args.submission) as tar:
-            tar.extractall(path=td)
+            tar.extractall(path=td, filter="data")
 
-        # Run backtest
-        res = run_backtest(Path(td) / "submission", data_df, args.fee / 10000, {
-            "fiat": args.fiat_balance,
-            "token_1": args.token1_balance,
-            "token_2": args.token2_balance,
-        })
+        submission_dir = Path(td) / "submission"
+        best_params = None
+
+        if args.optimize:
+            if optuna is None:
+                print("Error: Optuna no está disponible. Instala dependencias y vuelve a intentar.")
+                sys.exit(1)
+
+            print(f"\nIniciando optimización de hiperparámetros ({args.optimize_trials} trials)...")
+
+            template_mod = _get_strategy_module(submission_dir)
+            if not hasattr(template_mod, "get_hyperparams_template"):
+                print("Error: strategy.main no expone get_hyperparams_template().")
+                sys.exit(1)
+
+            param_template = template_mod.get_hyperparams_template()
+            flat_template = _flatten_numeric_params(param_template)
+            if not flat_template:
+                print("Error: No se encontraron hiperparámetros numéricos optimizables.")
+                sys.exit(1)
+
+            def objective(trial):
+                trial_params = {}
+                for key_path, default in flat_template.items():
+                    sampled = _suggest_from_default(trial, key_path, default)
+                    _set_nested_value(trial_params, key_path, sampled)
+
+                _, trial_metrics = run_backtest(
+                    submission_dir,
+                    data_df.copy(),
+                    args.fee / 10000,
+                    base_balances.copy(),
+                    strategy_params=trial_params,
+                )
+                trial_score, _ = score_from_metrics(trial_metrics)
+                return trial_score
+
+            #sampler = optuna.samplers.RandomSampler()
+            sampler = optuna.samplers.CmaEsSampler()
+
+            study = optuna.create_study(
+                direction="maximize",
+                sampler=sampler
+            )
+
+            study.optimize(objective, n_trials=args.optimize_trials, n_jobs=1, catch=(Exception,))
+
+            completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+            if not completed_trials:
+                print("Error: Ningun trial de Optuna se completo exitosamente.")
+                print("Revisa los warnings de los trials fallidos para identificar la causa raiz.")
+                sys.exit(1)
+
+            best_params = {}
+            for key_path, default in flat_template.items():
+                trial_key = "__".join(key_path)
+                sampled = study.best_params.get(trial_key, default)
+                _set_nested_value(best_params, key_path, sampled)
+
+            with open(params_file, "w") as f:
+                json.dump(best_params, f, indent=2)
+            print(f"Hiperparámetros guardados en: {params_file}")
+            print("Mejores hiperparámetros encontrados:")
+            print(json.dumps(best_params, indent=2))
+
+        else:
+            if params_file.exists():
+                with open(params_file) as f:
+                    best_params = json.load(f)
+                print(f"Cargando hiperparámetros desde: {params_file}")
+
+        # Run final backtest (con mejores parámetros si optimize=True)
+        res_df, metrics = run_backtest(
+            submission_dir,
+            data_df.copy(),
+            args.fee / 10000,
+            base_balances.copy(),
+            strategy_params=best_params,
+        )
+
+        score, score_components = score_from_metrics(metrics)
+
+        ordered_res = {
+            "score": score,
+            "score_components": score_components,
+            "pnl": {
+                "absolute": metrics["absolute_pnl"],
+                "percentage": metrics["percentage_pnl"],
+                "initial_equity": metrics["initial_equity"],
+                "final_equity": metrics["final_equity"]
+            },
+            "trading": {
+                "sharpe": metrics["sharpe"],
+                "max_drawdown": metrics["max_dd"],
+                "turnover": metrics["turnover"],
+                "trade_count": metrics["trade_count"],
+                "total_fees_paid": metrics["total_fees_paid"],
+            }
+        }
+        if best_params is not None:
+            ordered_res["optimized"] = True
+            ordered_res["best_params"] = best_params
+
+        # Formatear números para una mejor visualización JSON
+        def format_numbers(obj):
+            if isinstance(obj, dict):
+                return {k: format_numbers(v) for k, v in obj.items()}
+            elif isinstance(obj, (float, np.floating)):
+                return round(float(obj), 4)
+            return obj
+
+        print("\n" + "="*45)
+        print("📊 RESULTADOS DEL BACKTEST (KAGGLE SCORE)")
+        print("="*45)
+        print(json.dumps(format_numbers(ordered_res), indent=2))
+        print("="*45)
 
         # Save resulting trades to csv
-        res.to_csv(args.output, index=False)
+        res_df.to_csv(args.output, index=False)
+        print(f"\n✅ Trades guardados con éxito en: {args.output}\n")
 
 
 if __name__ == "__main__":
@@ -233,6 +502,8 @@ if __name__ == "__main__":
     p.add_argument("--token2_balance", help="Initial token_2 balance", type=float, default=0.0)
     p.add_argument("--fiat_balance", help="Initial fiat balance", type=float, default=10000.0)
     p.add_argument("--fee", help="Trading fee (in basis points, e.g., 3 = 0.03% = 0.0003)", type=float, default=3.0)
+    p.add_argument("--optimize", help="Optimize momentum hyperparameters with Optuna", action="store_true")
+    p.add_argument("--optimize-trials", help="Number of Optuna trials", type=int, default=10)
     args = p.parse_args()
 
     main(args)

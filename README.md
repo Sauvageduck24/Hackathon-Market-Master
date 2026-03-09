@@ -50,6 +50,9 @@ just tar
 # Run the strategy in live mode
 just trade
 
+# Run backtest metrics on train data
+just prueba
+
 ```
 
 ## Evaluation Criteria
