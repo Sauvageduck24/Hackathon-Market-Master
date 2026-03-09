@@ -3,6 +3,7 @@ import argparse, importlib.util, time, tarfile, tempfile, sys, json, os
 import uuid
 from pathlib import Path
 import pandas as pd
+from tqdm import tqdm
 
 # --- Core Engine ---------------------------------------------------------
 
@@ -165,7 +166,13 @@ def run_backtest(submission_dir: Path, combined_data: pd.DataFrame, fee: float, 
     )
 
     # Process data timestamp by timestamp
-    for timestamp, group in combined_data.groupby('timestamp'):
+    groups = combined_data.groupby('timestamp')
+    try:
+        total_groups = int(combined_data['timestamp'].nunique())
+    except Exception:
+        total_groups = None
+
+    for timestamp, group in tqdm(groups, total=total_groups, desc="Backtest"):
         # Update prices for each pair in this timestamp
         market_data = {
             "fee": fee
