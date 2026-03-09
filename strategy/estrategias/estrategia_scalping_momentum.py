@@ -153,23 +153,32 @@ class Strategy:
             self.low_history[pair].append(low)
             self.volume_history[pair].append(volume)
 
+            # Sync position state from balances BEFORE making decisions.
+            base, _ = pair.split("/")
+            current_bal = float(balances.get(base, 0.0))
+            if current_bal <= EPS:
+                # No position — reset entry price
+                self.position[pair] = 0.0
+                self.entry_price[pair] = 0.0
+            elif self.position[pair] <= EPS and current_bal > EPS:
+                # Position opened externally or this is first tick with balance
+                self.position[pair] = current_bal
+                self.entry_price[pair] = close  # best approximation
+
             # Exit first for faster risk-off behavior on 1-minute bars.
             exit_action = self._exit_signal(pair, close, balances, fee)
             if exit_action is not None:
                 actions.append(exit_action)
+                # Mark position as closing so entry logic skips this tick
+                self.position[pair] = 0.0
+                self.entry_price[pair] = 0.0
                 continue
 
             entry_action = self._entry_signal(pair, close, balances, fee)
             if entry_action is not None:
                 actions.append(entry_action)
-
-        # Update local position cache using current balances after decisions.
-        for pair in self.close_history:
-            base, _ = pair.split("/")
-            self.position[pair] = float(balances.get(base, 0.0))
-            if self.position[pair] <= EPS:
-                self.entry_price[pair] = 0.0
-            elif self.entry_price[pair] <= EPS and len(self.close_history[pair]) > 0:
-                self.entry_price[pair] = float(self.close_history[pair][-1])
+                # Record entry price NOW, at decision time
+                self.position[pair] = current_bal  # will be updated next tick
+                self.entry_price[pair] = close
 
         return actions if actions else None

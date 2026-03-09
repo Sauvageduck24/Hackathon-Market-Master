@@ -9,6 +9,7 @@ Orchestrates the full signal pipeline:
 
 import importlib
 import os
+import time
 
 from .estrategia_blend import SignalBlender
 from .coordinador import PositionCoordinator
@@ -45,6 +46,8 @@ def on_data(market_data, balances):
         sigs = strat.on_data(market_data, balances)
         all_signals[name] = sigs if sigs else []
 
+    print(all_signals)
+
     # 2. Blend → one consensus signal per pair
     blended = _blender.combine(all_signals, market_data)
 
@@ -54,4 +57,10 @@ def on_data(market_data, balances):
     # 4. Size each accepted signal
     actions = _risk_mgr.size(filtered, balances, market_data)
 
+    print(actions)
+
+    if all_signals['estrategia_scalping_momentum']:
+        time.sleep(5)
+
     return actions if actions else None
+

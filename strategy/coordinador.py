@@ -40,18 +40,41 @@ class PositionCoordinator:
         Returns:
             Filtered (possibly augmented) list of signal dicts.
         """
+
         self._step += 1
         accepted = []
 
-        # Refresh position tracking from balances
+        # Build open_pairs directly from balances — NOT from incoming signals.
+        # This is the only source of truth: if we hold base asset, position is open.
         open_pairs = set()
         for sig in signals:
             pair = sig["pair"]
             base, _ = pair.split("/")
+            # Si el balance del activo base es mayor que EPS, consideramos
+            # que hay una posición abierta para ese par.
             if float(balances.get(base, 0.0)) > EPS:
                 open_pairs.add(pair)
+                # Si acabamos de detectar la posición, registrar el paso
+                # en el que se abrió para poder aplicar reglas de tiempo.
                 if pair not in self._position_open_step:
                     self._position_open_step[pair] = self._step
+
+        # Also check pairs NOT in current signals — positions may exist without
+        # a signal this tick (e.g. held from previous steps).
+        for pair, opened in list(self._position_open_step.items()):
+            base, _ = pair.split("/")
+            # Comprueba balances actuales para pares que no están en `signals`.
+            # Si el balance indica que la posición ya no existe, limpiar
+            # el estado interno para evitar fugas de memoria.
+            if float(balances.get(base, 0.0)) > EPS:
+                open_pairs.add(pair)
+            else:
+                # La posición fue cerrada externamente — eliminar seguimiento.
+                del self._position_open_step[pair]
+
+        print("BALANCES:", balances)
+        print("OPEN_PAIRS:", open_pairs)
+        print("POSITION_OPEN_STEP:", self._position_open_step)
 
         for sig in signals:
             pair = sig["pair"]
@@ -65,11 +88,19 @@ class PositionCoordinator:
                 continue
 
             if side == "buy":
+                # Sólo permitir `buy` si no tenemos posición abierta. Si ya
+                # estamos dentro, sólo permitir añadir más si la señal es
+                # muy fuerte (consenso >= 0.8).
                 if has_pos and sig.get("consensus_score", 0) < 0.8:
-                    continue  # already holding, consensus not strong enough
+                    continue
             elif side == "sell":
+                # No permitir `sell` si no hay posición (nada que vender).
                 if not has_pos:
-                    continue  # nothing to sell
+                    continue
+
+            # Registro rápido para depuración en desarrollo — muestra la
+            # señal y si actualmente hay posición para ese par.
+            print(sig, has_pos)
 
             accepted.append(sig)
 
@@ -77,6 +108,9 @@ class PositionCoordinator:
         for sig in accepted:
             self._last_signal_step[sig["pair"]] = self._step
             base, _ = sig["pair"].split("/")
+            # Actualizar estado por señales aceptadas:
+            # - Si aceptamos un `buy` y no había posición, registrar apertura.
+            # - Si aceptamos un `sell`, eliminar el registro de posición.
             if sig["side"] == "buy" and sig["pair"] not in open_pairs:
                 self._position_open_step[sig["pair"]] = self._step
             elif sig["side"] == "sell":
@@ -91,13 +125,17 @@ class PositionCoordinator:
             if already:
                 continue
             base, _ = pair.split("/")
+            # Si la posición excede `max_hold_steps`, inyectar una señal de
+            # `sell` de fuerza media para que el gestor de riesgo la cierre.
             if float(balances.get(base, 0.0)) > EPS:
                 accepted.append({
                     "pair": pair,
                     "side": "sell",
+                    # Score genérico para indicar que es una señal forzada.
                     "consensus_score": 0.5,
                     "n_votes": 0,
                 })
+                # Actualizar cooldown y limpiar estado de posición.
                 self._last_signal_step[pair] = self._step
                 del self._position_open_step[pair]
 
