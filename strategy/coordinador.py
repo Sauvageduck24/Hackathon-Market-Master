@@ -10,20 +10,20 @@ EPS = 1e-9
 class PositionCoordinator:
     """Filtro minimo y determinista con parametros configurables."""
 
+    POSITION_EPS = 1e-9
+
     def __init__(self):
         self.params = {
-            "position_eps": EPS,
-            "buy_min_score": 0.0,
-            "sell_min_score": 0.0,
+            "buy_min_score": 0.3,
+            "sell_min_score": 0.4,
         }
         self._sync_params()
 
     def _sync_params(self):
-        self.position_eps = max(float(self.params["position_eps"]), 1e-12)
+        self.position_eps = self.POSITION_EPS
         self.buy_min_score = min(max(float(self.params["buy_min_score"]), 0.0), 1.0)
         self.sell_min_score = min(max(float(self.params["sell_min_score"]), 0.0), 1.0)
 
-        self.params["position_eps"] = self.position_eps
         self.params["buy_min_score"] = self.buy_min_score
         self.params["sell_min_score"] = self.sell_min_score
 
@@ -59,7 +59,7 @@ class PositionCoordinator:
             if side == "buy":
                 if score < self.buy_min_score:
                     continue
-                if has_pos:
+                if has_pos: # no borrar este comentario!
                     continue
             elif side == "sell":
                 if score < self.sell_min_score:

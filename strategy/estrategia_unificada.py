@@ -38,6 +38,10 @@ _P2F = "token_2/fiat"
 _P12 = "token_1/token_2"
 
 
+def _clamp01(value):
+    return min(max(float(value), 0.0), 1.0)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers estadísticos
 # ──────────────────────────────────────────────────────────────────────────────
@@ -51,7 +55,7 @@ def _sma(arr, w):
 def _ema(arr, period):
     if len(arr) < period:
         return None
-    arr_seq = list(arr)
+    arr_seq = list(arr)[-period:]
     alpha = 2.0 / (period + 1)
     v = float(arr_seq[0])
     for x in arr_seq[1:]:
@@ -112,55 +116,51 @@ def _realized_vol(closes, w):
 class Strategy:
     """Estrategia unificada multi-módulo."""
 
-    # ── Presupuestos de capital por módulo (deben sumar <= 1.0) ─────────────
-    #   Arbitraje:    20% — opera solo cuando hay oportunidad real
-    #   Lead-lag:     15% — señal anticipada cross-asset
-    #   Mean-rev:     25% — z-score intra-asset
-    #   Momentum:     20% — tendencia confirmada
-    #   (Reserva 20% de buffer para MaxDD)
-    BUDGET_ARB      = 0.20
-    BUDGET_LAG      = 0.15
-    BUDGET_MR       = 0.25
-    BUDGET_MOM      = 0.20
+    FIXED_PARAMS = {
+        # Ventanas fijas
+        "w_fast": 8,
+        "w_slow": 21,
+        "w_roc": 10,
+        "w_atr": 14,
+        "w_vol_sma": 20,
+        "max_hist": 200,
+        # Cooldowns fijos
+        "cd_arb": 1,
+        "cd_lag": 10,
+        "cd_mr": 8,
+        "cd_mom": 5,
+        "cd_panic": 20,
+        # Presupuestos fijos
+        "budget_arb": 0.20,
+        "budget_lag": 0.15,
+        "budget_mr": 0.25,
+        "budget_mom": 0.20,
+        # Otros fijos
+        "take_profit_pct": 0.0,
+        "emergency_sell_frac": 0.0,
+    }
 
     def __init__(self):
         self.params = {
-            # Presupuestos de capital por módulo
-            "budget_arb": 0.20,
-            "budget_lag": 0.15,
-            "budget_mr": 0.25,
-            "budget_mom": 0.20,
-            # Ventanas
+            # Ventanas tunables
             "w_spread": 60,
             "w_mr": 40,
             "w_vol": 30,
-            "w_fast": 8,
-            "w_slow": 21,
-            "w_roc": 10,
-            "w_atr": 14,
-            "w_vol_sma": 20,
-            "max_hist": 200,
-            # Thresholds base
+            # Thresholds tunables
             "z_mr_base": 1.8,
             "z_panic": 3.0,
             "panic_rp": 0.70,
             "roc_div": 0.006,
             "spread_z": 1.8,
             "arb_edge_mul": 3.0,
-            # Cooldowns (en ticks)
-            "cd_arb": 1,
-            "cd_lag": 10,
-            "cd_mr": 8,
-            "cd_mom": 5,
-            "cd_panic": 20,
         }
-        # Compatibilidad con la petición de `self.param`.
-        self.param = self.params
         self._sync_params()
         self._reset_state()
 
     def _sync_params(self):
-        p = self.params
+        # Los parametros fijos se aplican siempre y no forman parte de HPO.
+        p = dict(self.FIXED_PARAMS)
+        p.update(self.params)
 
         # Presupuestos
         self.BUDGET_ARB = min(max(float(p["budget_arb"]), 0.0), 1.0)
@@ -197,30 +197,16 @@ class Strategy:
         self.CD_PANIC = max(1, int(p["cd_panic"]))
 
         # Guardar normalizados para plantilla de HPO
-        p["budget_arb"] = self.BUDGET_ARB
-        p["budget_lag"] = self.BUDGET_LAG
-        p["budget_mr"] = self.BUDGET_MR
-        p["budget_mom"] = self.BUDGET_MOM
-        p["w_spread"] = self.W_SPREAD
-        p["w_mr"] = self.W_MR
-        p["w_vol"] = self.W_VOL
-        p["w_fast"] = self.W_FAST
-        p["w_slow"] = self.W_SLOW
-        p["w_roc"] = self.W_ROC
-        p["w_atr"] = self.W_ATR
-        p["w_vol_sma"] = self.W_VOL_SMA
-        p["max_hist"] = self.MAX_HIST
-        p["z_mr_base"] = self.Z_MR_BASE
-        p["z_panic"] = self.Z_PANIC
-        p["panic_rp"] = self.PANIC_RP
-        p["roc_div"] = self.ROC_DIV
-        p["spread_z"] = self.SPREAD_Z
-        p["arb_edge_mul"] = self.ARB_EDGE_MUL
-        p["cd_arb"] = self.CD_ARB
-        p["cd_lag"] = self.CD_LAG
-        p["cd_mr"] = self.CD_MR
-        p["cd_mom"] = self.CD_MOM
-        p["cd_panic"] = self.CD_PANIC
+        # Normalizamos solo los tunables expuestos en self.params.
+        self.params["w_spread"] = self.W_SPREAD
+        self.params["w_mr"] = self.W_MR
+        self.params["w_vol"] = self.W_VOL
+        self.params["z_mr_base"] = self.Z_MR_BASE
+        self.params["z_panic"] = self.Z_PANIC
+        self.params["panic_rp"] = self.PANIC_RP
+        self.params["roc_div"] = self.ROC_DIV
+        self.params["spread_z"] = self.SPREAD_Z
+        self.params["arb_edge_mul"] = self.ARB_EDGE_MUL
 
     def _reset_state(self):
         mh = self.MAX_HIST
@@ -235,7 +221,9 @@ class Strategy:
     def set_params(self, params):
         if not params:
             return
-        self.params.update(params)
+        tunables = {k: v for k, v in params.items() if k not in self.FIXED_PARAMS}
+        if tunables:
+            self.params.update(tunables)
         self._sync_params()
         self._reset_state()
 
@@ -264,7 +252,7 @@ class Strategy:
         if not self._ok("arb", self.CD_ARB):
             return []
 
-        edge = max(0.002, self.ARB_EDGE_MUL * fee)
+        edge = self.ARB_EDGE_MUL * fee
         implied = p1f / (p2f + EPS)
         fiat_bal = float(balances.get("fiat", 0.0))
         if fiat_bal < 10.0:
@@ -290,17 +278,17 @@ class Strategy:
         if out1 > min_out and p12 < implied * (1.0 - edge):
             self._mark("arb")
             return [
-                {"pair": _P1F, "side": "buy",  "qty": q1},
-                {"pair": _P12, "side": "sell", "qty": q1s},
-                {"pair": _P2F, "side": "sell", "qty": t2},
+                {"pair": _P1F, "side": "buy",  "qty": q1,  "bypass_pipeline": True},
+                {"pair": _P12, "side": "sell", "qty": q1s, "bypass_pipeline": True},
+                {"pair": _P2F, "side": "sell", "qty": t2,  "bypass_pipeline": True},
             ]
 
         if out2 > min_out and p12 > implied * (1.0 + edge):
             self._mark("arb")
             return [
-                {"pair": _P2F, "side": "buy",  "qty": q2},
-                {"pair": _P12, "side": "buy",  "qty": q1r},
-                {"pair": _P1F, "side": "sell", "qty": q1r},
+                {"pair": _P2F, "side": "buy",  "qty": q2,  "bypass_pipeline": True},
+                {"pair": _P12, "side": "buy",  "qty": q1r, "bypass_pipeline": True},
+                {"pair": _P1F, "side": "sell", "qty": q1r, "bypass_pipeline": True},
             ]
 
         return []
@@ -333,17 +321,29 @@ class Strategy:
         t2_bal     = float(balances.get("token_2", 0.0))
         p2f = float(self._c[_P2F][-1])
 
-        if divergence > threshold and fiat_bal > 0:
+        if self.step >= self.W_SLOW + 5 and divergence > threshold and fiat_bal > 0:
             qty = (fiat_bal * self.BUDGET_LAG) / (p2f * (1.0 + fee) + EPS)
             if qty > 0:
                 self._mark("lag")
-                return {"pair": _P2F, "side": "buy", "qty": qty}
+                strength = _clamp01((divergence - threshold) / (2.0 * threshold + EPS))
+                return {
+                    "pair": _P2F,
+                    "side": "buy",
+                    "qty": qty,
+                    "consensus_score": 0.55 + 0.45 * strength,
+                }
 
         if divergence < -threshold and t2_bal > 0:
             qty = t2_bal * self.BUDGET_LAG
             if qty > 0:
                 self._mark("lag")
-                return {"pair": _P2F, "side": "sell", "qty": qty}
+                strength = _clamp01((abs(divergence) - threshold) / (2.0 * threshold + EPS))
+                return {
+                    "pair": _P2F,
+                    "side": "sell",
+                    "qty": qty,
+                    "consensus_score": 0.55 + 0.45 * strength,
+                }
 
         return None
 
@@ -372,14 +372,26 @@ class Strategy:
             qty = t2_bal * alloc
             if qty > 0:
                 self._mark("spread")
-                return {"pair": _P2F, "side": "sell", "qty": qty}
+                strength = _clamp01((z - self.SPREAD_Z) / (self.SPREAD_Z + EPS))
+                return {
+                    "pair": _P2F,
+                    "side": "sell",
+                    "qty": qty,
+                    "consensus_score": 0.55 + 0.45 * strength,
+                }
 
         # Spread bajo (ETH barata vs BTC) → comprar ETH
-        if z < -self.SPREAD_Z and fiat_bal > 0:
+        if self.step >= self.W_SLOW + 5 and z < -self.SPREAD_Z and fiat_bal > 0:
             qty = (fiat_bal * alloc) / (p2f * (1.0 + fee) + EPS)
             if qty > 0:
                 self._mark("spread")
-                return {"pair": _P2F, "side": "buy", "qty": qty}
+                strength = _clamp01((abs(z) - self.SPREAD_Z) / (self.SPREAD_Z + EPS))
+                return {
+                    "pair": _P2F,
+                    "side": "buy",
+                    "qty": qty,
+                    "consensus_score": 0.55 + 0.45 * strength,
+                }
 
         return None
 
@@ -414,40 +426,39 @@ class Strategy:
         cr = high - low + EPS
         range_pos = (close - low) / cr   # posición del cierre en la vela
 
-        # ── Señal de pánico extremo (alta convicción, cooldown largo) ────
-        is_panic = (
-            z < -self.Z_PANIC
-            and range_pos > self.PANIC_RP
-            and not self._ok(f"panic_{pair}", self.CD_PANIC)
-        )
-        # Nota: invertimos el chequeo para que actúe solo cuando el cooldown
-        # de pánico ha pasado, pero queremos asegurarnos de entrar:
         panic_ready = (
             z < -self.Z_PANIC
             and range_pos > self.PANIC_RP
             and self._ok(f"panic_{pair}", self.CD_PANIC)
             and quote_bal > 0
         )
-        if panic_ready:
+        if panic_ready and self.step >= self.W_SLOW + 5:
             alloc = min(self.BUDGET_MR, 0.35)
             qty = (quote_bal * alloc) / (close * (1.0 + fee))
             if qty > 0:
                 self._mark(f"panic_{pair}")
                 self._mark(f"mr_{pair}")
-                return {"pair": pair, "side": "buy", "qty": qty}
+                panic_strength = _clamp01(abs(z) / (self.Z_PANIC + EPS))
+                return {
+                    "pair": pair,
+                    "side": "buy",
+                    "qty": qty,
+                    "consensus_score": 0.65 + 0.35 * panic_strength,
+                }
 
         # ── Mean-reversion normal ────────────────────────────────────────
         if not self._ok(f"mr_{pair}", self.CD_MR):
             return None
 
         # Compra: z muy negativo + vela con rechazo alcista (range_pos > 0.5)
-        if z < -band and range_pos > 0.5 and quote_bal > 0:
+        if self.step >= self.W_SLOW + 5 and z < -band and range_pos > 0.5 and quote_bal > 0:
             strength = min(abs(z) / band, 2.0)
             alloc = min(self.BUDGET_MR * 0.4 * strength, self.BUDGET_MR)
             qty = (quote_bal * alloc) / (close * (1.0 + fee))
             if qty > 0:
                 self._mark(f"mr_{pair}")
-                return {"pair": pair, "side": "buy", "qty": qty}
+                score = 0.5 + 0.45 * _clamp01((strength - 1.0) / 1.0)
+                return {"pair": pair, "side": "buy", "qty": qty, "consensus_score": score}
 
         # Venta: z positivo → precio ha revertido a la media o la ha superado
         if z > band * 0.6 and base_bal > 0:
@@ -455,7 +466,9 @@ class Strategy:
             qty = base_bal * sell_frac
             if qty > 0:
                 self._mark(f"mr_{pair}")
-                return {"pair": pair, "side": "sell", "qty": qty}
+                strength = _clamp01((z - 0.6 * band) / (0.8 * band + EPS))
+                score = 0.6 + 0.4 * strength
+                return {"pair": pair, "side": "sell", "qty": qty, "consensus_score": score}
 
         return None
 
@@ -469,10 +482,10 @@ class Strategy:
         ATR dota de sizing dinámico y gestión de riesgo.
         Volumen filtra señales falsas.
         """
-        closes  = np.asarray(self._c[pair], dtype=float)
-        highs   = np.asarray(self._h[pair], dtype=float)
-        lows    = np.asarray(self._l[pair], dtype=float)
-        volumes = np.asarray(self._v[pair], dtype=float)
+        closes = self._c[pair]
+        highs = self._h[pair]
+        lows = self._l[pair]
+        volumes = self._v[pair]
 
         need = max(self.W_SLOW + 5, self.W_ROC + 1, self.W_ATR + 2, self.W_VOL_SMA + 1)
         if len(closes) < need or not self._ok(f"mom_{pair}", self.CD_MOM):
@@ -481,13 +494,19 @@ class Strategy:
         fast_ema = _ema(closes, self.W_FAST)
         slow_ema = _ema(closes, self.W_SLOW)
         roc      = _roc(closes, self.W_ROC)
-        atr      = _atr(highs, lows, closes, self.W_ATR)
+        need_w = max(self.W_ATR + 2, self.W_VOL_SMA + 1)
+        closes_arr = np.asarray(list(closes)[-need_w:], dtype=float)
+        highs_arr = np.asarray(list(highs)[-need_w:], dtype=float)
+        lows_arr = np.asarray(list(lows)[-need_w:], dtype=float)
+        volumes_arr = np.asarray(list(volumes)[-need_w:], dtype=float)
+
+        atr = _atr(highs_arr, lows_arr, closes_arr, self.W_ATR)
 
         if None in (fast_ema, slow_ema, roc, atr) or atr <= EPS:
             return None
 
-        vol_avg = float(np.mean(volumes[-self.W_VOL_SMA:])) + EPS
-        vol_ratio = float(volumes[-1]) / vol_avg
+        vol_avg = float(np.mean(volumes_arr[-self.W_VOL_SMA:])) + EPS
+        vol_ratio = float(volumes_arr[-1]) / vol_avg
 
         base, quote = pair.split("/")
         base_bal  = float(balances.get(base,  0.0))
@@ -498,14 +517,21 @@ class Strategy:
         roc_thresh = max(0.003, rv * 1.5)
 
         # ── BUY: EMA alcista + ROC positivo + volumen elevado ────────────
-        if fast_ema > slow_ema and roc > roc_thresh and vol_ratio > 1.15 and quote_bal > 0:
+        if (
+            self.step >= self.W_SLOW + 5
+            and fast_ema > slow_ema
+            and roc > roc_thresh
+            and vol_ratio > 1.15
+            and quote_bal > 0
+        ):
             # Sizing proporcional a calidad de señal (momentum + volumen)
             signal_q = min(roc / roc_thresh, 2.0) * min(vol_ratio / 1.15, 1.5)
             alloc = min(self.BUDGET_MOM * 0.5 * signal_q, self.BUDGET_MOM)
             qty = (quote_bal * alloc) / (close * (1.0 + fee))
             if qty > 0:
                 self._mark(f"mom_{pair}")
-                return {"pair": pair, "side": "buy", "qty": qty}
+                score = 0.55 + 0.45 * _clamp01((signal_q - 1.0) / 1.0)
+                return {"pair": pair, "side": "buy", "qty": qty, "consensus_score": score}
 
         # ── SELL: EMA bajista + ROC negativo ────────────────────────────
         if fast_ema < slow_ema and roc < -roc_thresh and base_bal > 0:
@@ -514,7 +540,8 @@ class Strategy:
             qty = base_bal * sell_frac
             if qty > 0:
                 self._mark(f"mom_{pair}")
-                return {"pair": pair, "side": "sell", "qty": qty}
+                score = 0.6 + 0.4 * _clamp01((signal_q - 1.0) / 1.0)
+                return {"pair": pair, "side": "sell", "qty": qty, "consensus_score": score}
 
         return None
 
@@ -550,13 +577,47 @@ class Strategy:
                 - np.log(float(self._c[_P1F][-1]) + EPS)
             )
 
+        # --- NUEVO: FASE DE LIMPIEZA INICIAL ---
+        # Cleanup one-shot: liquidar inventario heredado en el primer tick
+        # para evitar residuos que bloqueen compras en el coordinador.
+        if self.step == 1:
+            limpieza = []
+            if float(balances.get("token_1", 0.0)) > EPS:
+                qty = float(balances.get("token_1", 0.0))
+                if qty > EPS:
+                    limpieza.append(
+                        {
+                            "pair": _P1F,
+                            "side": "sell",
+                            "qty": qty,
+                            "bypass_pipeline": True,
+                            "reason": "cleanup_liquidation",
+                        }
+                    )
+            if float(balances.get("token_2", 0.0)) > EPS:
+                qty = float(balances.get("token_2", 0.0))
+                if qty > EPS:
+                    limpieza.append(
+                        {
+                            "pair": _P2F,
+                            "side": "sell",
+                            "qty": qty,
+                            "bypass_pipeline": True,
+                            "reason": "cleanup_liquidation",
+                        }
+                    )
+
+            if limpieza:
+                return limpieza
+        # ---------------------------------------
+
         # Requerir los tres pares para señales cross-asset
         has_all = all(
             len(self._c[p]) > 0 for p in [_P1F, _P2F, _P12]
         )
 
         # ── MÓDULO 1: Arbitraje ─────────────────────────────────────────
-        if has_all:
+        if has_all and self.step >= self.W_SLOW + 5:
             p1f = float(self._c[_P1F][-1])
             p2f = float(self._c[_P2F][-1])
             p12 = float(self._c[_P12][-1])

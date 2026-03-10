@@ -1,125 +1,171 @@
-"""Strategy entry point required by the exchange engine.
-
-Orchestrates the full signal pipeline:
-  1. Collect raw signals from all strategies in estrategias/
-  2. Blend into consensus signals  (estrategia_blend)
-  3. Filter through position rules  (coordinador)
-  4. Size trades via risk manager   (gestion_riesgo)
-"""
-
+"""Strategy entry point required by the exchange engine."""
 import importlib
-import os
+from pathlib import Path
 
-from .estrategia_blend import SignalBlender
-from .coordinador import PositionCoordinator
-from .gestion_riesgo import RiskManager
+DEFAULT_FEE = 0.0003 # 3 bps = 0.0003 = 0.03%
 
+# Import the strategy implementation
+try:
+    from .strategy import Strategy # type: ignore
+    strategy = Strategy()
+except ImportError:
+    # Fallback to a default implementation
+    class DefaultStrategy:
+        def __init__(self):
+            self.initialized = False
+            
+            # Price history for each pair - this maintains state between calls
+            self.price_history = {
+                "token_1/fiat": [],
+                "token_2/fiat": [],
+                "token_1/token_2": []
+            }
+            
+            # Window size for moving averages
+            self.window = 30
+            
+            # Volatility threshold for signals
+            self.threshold = 2.0
+    
+        def on_data(self, market_data, balances):
+            """Process market data and current balances to make trading decisions.
+            
+            Args:
+                market_data: Dictionary of {pair: tick_data} containing market data for each pair
+                balances: Dictionary of {currency: amount} containing current balances
+            
+            Returns:
+                Trading signal dict {pair, side, qty} or None
+            """
+            # Update price history for each pair
+            for pair, data in market_data.items():
+                if pair in self.price_history:
+                    self.price_history[pair].append(data["close"])
+                    # Limit history length
+                    if len(self.price_history[pair]) > self.window:
+                        self.price_history[pair] = self.price_history[pair][-self.window:]
+            
+            # Wait until we have enough data points
+            for prices in self.price_history.values():
+                if len(prices) < self.window:
+                    return None
+            
+            # Initialize flag for trading
+            if not self.initialized:
+                self.initialized = True
+                return None
+            
+            import numpy as np
+            
+            # Check for trading opportunities in token_1/fiat
+            if "token_1/fiat" in market_data:
+                prices = self.price_history["token_1/fiat"]
+                price = prices[-1]
+                mu, sigma = np.mean(prices), np.std(prices)
+                
+                if price < mu - self.threshold * sigma:
+                    # Buy token_1 with fiat if we have enough fiat
+                    qty = 0.01
+                    # Get fee from market_data if available, otherwise use default
+                    fee = market_data.get("fee", DEFAULT_FEE)
+                    required_fiat = qty * price * (1 + fee)
+                    if balances["fiat"] >= required_fiat:
+                        return [{"pair": "token_1/fiat", "side": "buy", "qty": qty}]
+                
+                elif price > mu + self.threshold * sigma:
+                    # Sell token_1 for fiat if we have enough token_1
+                    qty = min(0.01, balances["token_1"])  # Adjust qty based on available balance
+                    if qty > 0:
+                        return [{"pair": "token_1/fiat", "side": "sell", "qty": qty}]
+            
+            # Check for trading opportunities in token_2/fiat
+            if "token_2/fiat" in market_data:
+                prices = self.price_history["token_2/fiat"]
+                price = prices[-1]
+                mu, sigma = np.mean(prices), np.std(prices)
+                
+                if price < mu - self.threshold * sigma:
+                    # Buy token_2 with fiat if we have enough fiat
+                    qty = 0.1
+                    # Get fee from market_data if available, otherwise use default
+                    fee = market_data.get("fee", DEFAULT_FEE)
+                    required_fiat = qty * price * (1 + fee)
+                    if balances["fiat"] >= required_fiat:
+                        return [{"pair": "token_2/fiat", "side": "buy", "qty": qty}]
+                
+                elif price > mu + self.threshold * sigma:
+                    # Sell token_2 for fiat if we have enough token_2
+                    qty = min(0.1, balances["token_2"])  # Adjust qty based on available balance
+                    if qty > 0:
+                        return [{"pair": "token_2/fiat", "side": "sell", "qty": qty}]
+            
+            # Check for arbitrage opportunities with token_1/token_2
+            if all(pair in market_data for pair in ["token_1/fiat", "token_2/fiat", "token_1/token_2"]):
+                token1_price = market_data["token_1/fiat"]["close"]
+                token2_price = market_data["token_2/fiat"]["close"]
+                token1_token2_price = market_data["token_1/token_2"]["close"]
+                
+                # Calculate implied token_1/token_2 price
+                implied_token1_token2 = token1_price / token2_price
+                
+                # If actual token_1/token_2 price is significantly lower than implied
+                if token1_token2_price < implied_token1_token2 * 0.995:
+                    # Buy token_1 with token_2 (if we have token_2)
+                    qty_token1 = 0.01
+                    # Get fee from market_data if available, otherwise use default
+                    fee = market_data.get("fee", DEFAULT_FEE)
+                    required_token2 = qty_token1 * token1_token2_price * (1 + fee)
+                    if balances["token_2"] >= required_token2:
+                        return [{"pair": "token_1/token_2", "side": "buy", "qty": qty_token1}]
+                
+                # If actual token_1/token_2 price is significantly higher than implied
+                elif token1_token2_price > implied_token1_token2 * 1.005:
+                    # Sell token_1 for token_2 (if we have token_1)
+                    qty_token1 = min(0.01, balances["token_1"])  # Adjust qty based on available balance
+                    if qty_token1 > 0:
+                        return [{"pair": "token_1/token_2", "side": "sell", "qty": qty_token1}]
+            
+            return None
+    
+    strategy = DefaultStrategy()
 
-def _load_strategies():
-    """Dynamically import every Strategy class from estrategias/."""
-    strategies = {}
-    pkg_dir = os.path.join(os.path.dirname(__file__), "estrategias")
-    for fname in sorted(os.listdir(pkg_dir)):
-        if fname.startswith("_") or not fname.endswith(".py"):
-            continue
-        mod_name = fname[:-3]
-        mod = importlib.import_module(
-            f".estrategias.{mod_name}", package="strategy"
-        )
-        if hasattr(mod, "Strategy"):
-            strategies[mod_name] = mod.Strategy()
-    return strategies
-
-
-_strategies = _load_strategies()
-_blender = SignalBlender()
-_coordinator = PositionCoordinator()
-_risk_mgr = RiskManager()
-
-
-def reset():
-    """Reset all strategy components to a clean per-backtest state."""
-    for strat in _strategies.values():
-        if hasattr(strat, "reset"):
-            strat.reset()
-    if hasattr(_coordinator, "reset"):
-        _coordinator.reset()
-    if hasattr(_risk_mgr, "reset"):
-        _risk_mgr.reset()
-
-
-def set_params(params):
-    """Apply optimized params to strategy components.
-
-    Expected shape:
-        {
-            "estrategias": {"estrategia_momentum": {...}, ...},
-            "coordinador": {...},
-            "gestion_riesgo": {...}
-        }
+def on_data(market_data, balances):
+    """API required by the exchange engine.
+    
+    Args:
+        market_data: Dictionary of {pair: tick_data} containing market data for each pair
+        balances: Dictionary of {currency: amount} containing current balances
+        
+    Returns:
+        List of trading signals in dict {pair, side, qty} or None
     """
-    if not params:
-        return
-
-    strat_params = params.get("estrategias", {})
-    for name, cfg in strat_params.items():
-        strat = _strategies.get(name)
-        if strat is not None and hasattr(strat, "set_params"):
-            strat.set_params(cfg)
-
-    coord_params = params.get("coordinador")
-    if coord_params and hasattr(_coordinator, "set_params"):
-        _coordinator.set_params(coord_params)
-
-    risk_params = params.get("gestion_riesgo")
-    if risk_params and hasattr(_risk_mgr, "set_params"):
-        _risk_mgr.set_params(risk_params)
+    return strategy.on_data(market_data, balances)
 
 
 def get_hyperparams_template():
-    """Return current tunable params from all strategy components."""
-    estrategias = {}
-    for name, strat in _strategies.items():
-        if hasattr(strat, "params") and isinstance(strat.params, dict):
-            estrategias[name] = dict(strat.params)
-
-    coordinador = {}
-    if hasattr(_coordinator, "params") and isinstance(_coordinator.params, dict):
-        coordinador = dict(_coordinator.params)
-
-    gestion_riesgo = {}
-    if hasattr(_risk_mgr, "params") and isinstance(_risk_mgr.params, dict):
-        gestion_riesgo = dict(_risk_mgr.params)
-
+    """Expose hyperparameter template expected by exchange.trade."""
+    if hasattr(strategy, "get_hyperparams_template"):
+        return strategy.get_hyperparams_template()
     return {
-        "estrategias": estrategias,
-        "coordinador": coordinador,
-        "gestion_riesgo": gestion_riesgo,
+        "estrategias": {},
+        "coordinador": {},
+        "gestion_riesgo": {},
     }
 
-def on_data(market_data, balances):
-    """API required by the exchange engine."""
-    # 1. Raw signals from every strategy
-    all_signals = {}
-    for name, strat in _strategies.items():
-        sigs = strat.on_data(market_data, balances)
-        all_signals[name] = sigs if sigs else []
 
-    # 2. Blend → one consensus signal per pair
-    blended = _blender.combine(all_signals, market_data)
+def set_params(params):
+    """Apply optimized params if underlying strategy supports it."""
+    if hasattr(strategy, "set_params"):
+        strategy.set_params(params)
 
-    # 3. Filter through position / cooldown rules
-    filtered = _coordinator.filter(blended, balances, market_data)
 
-    # 4. Size each accepted signal
-    actions = _risk_mgr.size(filtered, balances, market_data)
+def set_load_weights(load_weights=True):
+    """Enable/disable loading persisted JSON weights inside strategy."""
+    if hasattr(strategy, "set_load_weights"):
+        strategy.set_load_weights(load_weights)
 
-    """if actions:
-        print('baalances:'  , balances)
-        print(all_signals)
-        print(actions)
 
-        if all_signals['estrategia_scalping_momentum']:
-            time.sleep(5)"""
-
-    return actions if actions else None
+def reset():
+    """Reset strategy state if underlying strategy supports it."""
+    if hasattr(strategy, "reset"):
+        strategy.reset()

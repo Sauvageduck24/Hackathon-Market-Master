@@ -1,0 +1,25 @@
+{
+  "estrategias": {
+    "estrategia_unificada": {
+      "w_spread": 78,
+      "w_mr": 50,
+      "w_vol": 20,
+      "z_mr_base": 2.237270668542043,
+      "z_panic": 4.95949177559889,
+      "panic_rp": 0.5826868469645301,
+      "roc_div": 0.011679473898286252,
+      "spread_z": 2.791951134185822,
+      "arb_edge_mul": 4.424600722561371
+    }
+  },
+  "coordinador": {
+    "buy_min_score": 0.2522659771540582,
+    "sell_min_score": 0.33000811960991233
+  },
+  "gestion_riesgo": {
+    "max_trade_pct": 0.10872795171809363,
+    "min_trade_pct": 0.14849935921561797,
+    "max_exposure_pct": 0.7750989227986211,
+    "sell_min_frac": 0.5785324913103848
+  }
+}

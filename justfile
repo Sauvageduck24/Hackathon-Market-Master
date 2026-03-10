@@ -26,7 +26,7 @@ TIMEFRAME   := "1m"
 
 # Default trading fees
 FEE := "3"  # In basis points (3 = 0.03%)
-OPTIMIZE_TRIALS := "30"
+OPTIMIZE_TRIALS := "15"
 
 # Default assets and balances
 # TOKEN_1 := "ETH"
@@ -59,6 +59,7 @@ alias d := download
 alias t := tar
 alias c := clean
 alias o := optimize
+alias oh := optimize_hard
 
 # install Python requirements
 install:
@@ -148,6 +149,7 @@ optimize team=TEAM token1=TOKEN_1 token2=TOKEN_2 fiat=FIAT token1_balance=TOKEN_
     FEE_PERCENT=$(echo "scale=2; {{fee}}/100" | bc)
     echo "Trading fee: {{fee}} basis points ($FEE_DECIMAL or ${FEE_PERCENT}%)"
     echo "Optuna trials: {{trials}}"
+    echo "Optuna clean start: enabled (fiat-only objective balances)"
 
     python -m exchange.trade ${STRATEGY_FILE} \
         --data {{DATA}}/test.csv \
@@ -156,6 +158,41 @@ optimize team=TEAM token1=TOKEN_1 token2=TOKEN_2 fiat=FIAT token1_balance=TOKEN_
         --fiat_balance {{fiat_balance}} \
         --fee {{fee}} \
         --optimize \
+        --optimize-clean-start \
+        --optimize-trials {{trials}}
+
+# optimize using hard dataset (2024 -> now)
+optimize_hard team=TEAM token1=TOKEN_1 token2=TOKEN_2 fiat=FIAT token1_balance=TOKEN_1_BALANCE token2_balance=TOKEN_2_BALANCE fiat_balance=FIAT_BALANCE fee=FEE trials=OPTIMIZE_TRIALS:
+    #!/usr/bin/env bash
+    # Calculate strategy file name
+    STRATEGY_FILE="{{team}}_submission.tgz"
+
+    echo "Preparing hard dataset merge..."
+    python scripts/merge.py \
+        {{DATA}}/btcusdt_1m_hard.csv \
+        {{DATA}}/ethusdt_1m_hard.csv \
+        {{DATA}}/ethbtc_1m_hard.csv \
+        --output {{DATA}}/test_hard.csv \
+        --token1 {{token1}} \
+        --token2 {{token2}} \
+        --fiat {{fiat}}
+
+    echo "Optimizing strategy with hard dataset for team {{team}}..."
+    echo "Initial balances: {{token1}}={{token1_balance}}, {{token2}}={{token2_balance}}, {{fiat}}={{fiat_balance}}"
+    FEE_DECIMAL=$(echo "scale=4; {{fee}}/10000" | bc)
+    FEE_PERCENT=$(echo "scale=2; {{fee}}/100" | bc)
+    echo "Trading fee: {{fee}} basis points ($FEE_DECIMAL or ${FEE_PERCENT}%)"
+    echo "Optuna trials: {{trials}}"
+    echo "Optuna clean start: enabled (fiat-only objective balances)"
+
+    python -m exchange.trade ${STRATEGY_FILE} \
+        --data {{DATA}}/test_hard.csv \
+        --token1_balance {{token1_balance}} \
+        --token2_balance {{token2_balance}} \
+        --fiat_balance {{fiat_balance}} \
+        --fee {{fee}} \
+        --optimize \
+        --optimize-clean-start \
         --optimize-trials {{trials}}
 
 # remove downloaded data and generated archives

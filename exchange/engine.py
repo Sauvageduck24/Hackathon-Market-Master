@@ -9,6 +9,7 @@ import pandas as pd
 MINUTES_PER_YEAR = 365 * 24 * 60
 ANNUALIZATION_FACTOR = np.sqrt(MINUTES_PER_YEAR)
 EPSILON = 1e-9
+MIN_EXEC_QTY = 0.01
 DEFAULT_RISK_FREE = 0.0
 DEFAULT_FEE = 0.0003 # 3 bps = 0.0003 = 0.03%
 
@@ -214,6 +215,8 @@ class Trader:
         pair = order["pair"]  # e.g., "token_1/fiat"
         side = order["side"]  # "buy" or "sell"
         qty = float(order["qty"])
+        if qty < MIN_EXEC_QTY:
+            return
         
         # Split the pair into base and quote currencies
         base, quote = pair.split("/")
