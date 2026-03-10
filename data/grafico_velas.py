@@ -10,6 +10,9 @@ from matplotlib.patches import Rectangle
 from tqdm import tqdm
 
 
+DAYS_TO_PLOT = 1
+
+
 def load_data(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     test_path = base_dir / "test.csv"
     submission_path = base_dir / "submission.csv"
@@ -19,6 +22,17 @@ def load_data(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     test_df["timestamp"] = pd.to_datetime(test_df["timestamp"])
     submission_df["timestamp"] = pd.to_datetime(submission_df["timestamp"])
+
+    test_start = test_df["timestamp"].min()
+    submission_start = submission_df["timestamp"].min()
+
+    if pd.notna(test_start):
+        test_end = test_start + pd.Timedelta(days=DAYS_TO_PLOT)
+        test_df = test_df[test_df["timestamp"] < test_end]
+
+    if pd.notna(submission_start):
+        submission_end = submission_start + pd.Timedelta(days=DAYS_TO_PLOT)
+        submission_df = submission_df[submission_df["timestamp"] < submission_end]
 
     return test_df.sort_values("timestamp"), submission_df.sort_values("timestamp")
 

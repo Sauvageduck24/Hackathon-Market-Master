@@ -103,6 +103,10 @@ just trade
 just optimize
 ```
 
+## Resultados
+
+![Gráfico de demostración de predicciones para el test final](data/grafico%20demostracion%20predicciones%20para%20test%20final%20de%20la%20competicion.png)
+
 ## Criterios de evaluación
 
 Las estrategias se puntúan mediante la fórmula del *score* de Kaggle que combina Sharpe ratio (70%), Max Drawdown (20%) y Turnover (10%).
