@@ -25,17 +25,17 @@ class RiskManager:
     FIXED_PARAMS = {
         "take_profit_pct": 0.0,
         "emergency_sell_frac": 0.0,
-        "sell_max_frac": 0.85,
         "stop_loss_pct": 0.0,
         "warmup_ticks": 0,
     }
 
     def __init__(self):
         self.params = {
-            "max_trade_pct": 0.15,
-            "min_trade_pct": 0.05,
+            "max_trade_pct": 0.02,
+            "min_trade_pct": 0.005,
             "max_exposure_pct": 0.80,
-            "sell_min_frac": 0.50,
+            "sell_min_frac": 0.15,
+            "sell_max_frac": 0.40,
         }
         self._sync_params()
 
@@ -68,6 +68,7 @@ class RiskManager:
         self.params["max_trade_pct"] = self.max_trade_pct
         self.params["max_exposure_pct"] = self.max_exposure_pct
         self.params["sell_min_frac"] = self.sell_min_frac
+        self.params["sell_max_frac"] = self.sell_max_frac
 
     def set_params(self, params):
         if not params:
@@ -81,6 +82,12 @@ class RiskManager:
             max_trade = float(tunables["max_trade_pct"])
             if min_trade > max_trade:
                 tunables["min_trade_pct"], tunables["max_trade_pct"] = max_trade, min_trade
+
+        if "sell_min_frac" in tunables and "sell_max_frac" in tunables:
+            sell_min = float(tunables["sell_min_frac"])
+            sell_max = float(tunables["sell_max_frac"])
+            if sell_min > sell_max:
+                tunables["sell_min_frac"], tunables["sell_max_frac"] = sell_max, sell_min
 
         if tunables:
             self.params.update(tunables)
@@ -133,6 +140,11 @@ class RiskManager:
                 )
             else:
                 action = self._size_sell(pair, base, score, balances)
+                # Cap sell size by max_trade_pct — same limit applied to buys.
+                if action is not None and close > 0:
+                    max_sell_qty = portfolio * self.max_trade_pct / close
+                    if max_sell_qty > 0:
+                        action["qty"] = min(action["qty"], max_sell_qty)
 
             if action is not None:
                 actions.append(action)
@@ -183,6 +195,12 @@ class RiskManager:
         min_q = MIN_SELL_QTY.get(base, MIN_SELL_QTY["default"])
         if qty < min_q:
             qty = base_bal if base_bal >= min_q else 0.0
+
+        # Prevent leaving unsellable dust: if remaining would be below min_q, sell all.
+        if qty > 0:
+            remaining = base_bal - qty
+            if 0 < remaining < min_q:
+                qty = base_bal
 
         if qty <= 0:
             return None

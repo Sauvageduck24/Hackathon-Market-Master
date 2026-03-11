@@ -559,12 +559,38 @@ def main(args: argparse.Namespace):
             if args.optimize_clean_start:
                 tv_cleanup_fixed = 100 * first_prices["token_1/fiat"] + 10 * first_prices["token_2/fiat"]
 
+            # Hard bounds for parameters that directly drive excess turnover.
+            # These override _suggest_from_default to prevent Optuna from exploring
+            # high-TV regions (e.g. very short cooldowns or very large trade budgets).
+            _HARD_LIMITS = {
+                "estrategias__estrategia_unificada__cd_arb":   (240, 1440),
+                "estrategias__estrategia_unificada__cd_lag":   (240, 1440),
+                "estrategias__estrategia_unificada__cd_mr":    (240, 1440),
+                "estrategias__estrategia_unificada__cd_mom":   (180, 1440),
+                "estrategias__estrategia_unificada__cd_panic": (240, 1440),
+                "estrategias__estrategia_unificada__budget_arb":  (0.003, 0.020),
+                "estrategias__estrategia_unificada__budget_lag":  (0.003, 0.020),
+                "estrategias__estrategia_unificada__budget_mr":   (0.003, 0.020),
+                "estrategias__estrategia_unificada__budget_mom":  (0.003, 0.020),
+                "gestion_riesgo__max_trade_pct":   (0.002, 0.010),
+                "gestion_riesgo__min_trade_pct":   (0.001, 0.006),
+                "coordinador__sell_min_score":     (0.60,  0.95),
+                "coordinador__buy_min_score":      (0.15,  0.55),
+            }
+
             def objective(trial):
-                # Objective != Kaggle score: uses robust_sharpe (bootstrap),
-                # omits max_dd, and penalizes adjusted turnover for clean-start runs.
+                # Aligned with Kaggle score: robust_sharpe, max_dd penalty, turnover penalty.
                 trial_params = {}
                 for key_path, default in flat_template.items():
-                    sampled = _suggest_from_default(trial, key_path, default)
+                    key_str = "__".join(key_path)
+                    if key_str in _HARD_LIMITS:
+                        lo, hi = _HARD_LIMITS[key_str]
+                        if isinstance(default, int):
+                            sampled = trial.suggest_int(key_str, int(lo), int(hi))
+                        else:
+                            sampled = trial.suggest_float(key_str, lo, hi)
+                    else:
+                        sampled = _suggest_from_default(trial, key_path, default)
                     _set_nested_value(trial_params, key_path, sampled)
 
                 trial_trader = Trader()
@@ -591,11 +617,12 @@ def main(args: argparse.Namespace):
                 sharpe_mean, sharpe_std = _bootstrap_sharpe_stats(rets)
                 robust_sharpe = sharpe_mean - 0.5 * sharpe_std
 
+                trial_max_dd = abs(max_drawdown(equity))
                 trade_penalty = 0.01 * max(0, 20 - trial_metrics["trade_count"])
                 tv_adj = trial_metrics["turnover"]
                 if args.optimize_clean_start:
                     tv_adj += tv_cleanup_fixed
-                return 0.7 * robust_sharpe - 0.1 * (tv_adj / 1e6) - trade_penalty
+                return 0.7 * robust_sharpe - 0.2 * trial_max_dd - 0.1 * (tv_adj / 1e6) - trade_penalty
 
             sampler = optuna.samplers.CmaEsSampler()
             study = optuna.create_study(direction="maximize", sampler=sampler)

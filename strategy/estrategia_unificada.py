@@ -124,17 +124,6 @@ class Strategy:
         "w_atr": 14,
         "w_vol_sma": 20,
         "max_hist": 200,
-        # Cooldowns fijos
-        "cd_arb": 1,
-        "cd_lag": 10,
-        "cd_mr": 8,
-        "cd_mom": 5,
-        "cd_panic": 20,
-        # Presupuestos fijos
-        "budget_arb": 0.20,
-        "budget_lag": 0.15,
-        "budget_mr": 0.25,
-        "budget_mom": 0.20,
         # Otros fijos
         "take_profit_pct": 0.0,
         "emergency_sell_frac": 0.0,
@@ -146,6 +135,17 @@ class Strategy:
             "w_spread": 60,
             "w_mr": 40,
             "w_vol": 30,
+            # Cooldowns tunables (altos para limitar turnover)
+            "cd_arb": 480,
+            "cd_lag": 360,
+            "cd_mr": 360,
+            "cd_mom": 240,
+            "cd_panic": 360,
+            # Presupuestos tunables (bajos para limitar turnover)
+            "budget_arb": 0.010,
+            "budget_lag": 0.010,
+            "budget_mr": 0.010,
+            "budget_mom": 0.010,
             # Thresholds tunables
             "z_mr_base": 1.8,
             "z_panic": 3.0,
@@ -207,6 +207,15 @@ class Strategy:
         self.params["roc_div"] = self.ROC_DIV
         self.params["spread_z"] = self.SPREAD_Z
         self.params["arb_edge_mul"] = self.ARB_EDGE_MUL
+        self.params["cd_arb"] = self.CD_ARB
+        self.params["cd_lag"] = self.CD_LAG
+        self.params["cd_mr"] = self.CD_MR
+        self.params["cd_mom"] = self.CD_MOM
+        self.params["cd_panic"] = self.CD_PANIC
+        self.params["budget_arb"] = self.BUDGET_ARB
+        self.params["budget_lag"] = self.BUDGET_LAG
+        self.params["budget_mr"] = self.BUDGET_MR
+        self.params["budget_mom"] = self.BUDGET_MOM
 
     def _reset_state(self):
         mh = self.MAX_HIST
@@ -576,40 +585,6 @@ class Strategy:
                 np.log(float(self._c[_P2F][-1]) + EPS)
                 - np.log(float(self._c[_P1F][-1]) + EPS)
             )
-
-        # --- NUEVO: FASE DE LIMPIEZA INICIAL ---
-        # Cleanup one-shot: liquidar inventario heredado en el primer tick
-        # para evitar residuos que bloqueen compras en el coordinador.
-        if self.step == 1:
-            limpieza = []
-            if float(balances.get("token_1", 0.0)) > EPS:
-                qty = float(balances.get("token_1", 0.0))
-                if qty > EPS:
-                    limpieza.append(
-                        {
-                            "pair": _P1F,
-                            "side": "sell",
-                            "qty": qty,
-                            "bypass_pipeline": True,
-                            "reason": "cleanup_liquidation",
-                        }
-                    )
-            if float(balances.get("token_2", 0.0)) > EPS:
-                qty = float(balances.get("token_2", 0.0))
-                if qty > EPS:
-                    limpieza.append(
-                        {
-                            "pair": _P2F,
-                            "side": "sell",
-                            "qty": qty,
-                            "bypass_pipeline": True,
-                            "reason": "cleanup_liquidation",
-                        }
-                    )
-
-            if limpieza:
-                return limpieza
-        # ---------------------------------------
 
         # Requerir los tres pares para señales cross-asset
         has_all = all(
