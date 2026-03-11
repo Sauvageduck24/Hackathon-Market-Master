@@ -1,36 +1,47 @@
 {
   "estrategias": {
     "estrategia_unificada": {
-      "w_spread": 74,
-      "w_mr": 59,
-      "w_vol": 30,
-      "cd_arb": 464,
-      "cd_lag": 966,
-      "cd_mr": 757,
-      "cd_mom": 1155,
-      "cd_panic": 1069,
-      "budget_arb": 0.012573456201832204,
-      "budget_lag": 0.013636116878032435,
-      "budget_mr": 0.008651611918449997,
-      "budget_mom": 0.010208229924358811,
-      "z_mr_base": 1.6002581787022274,
-      "z_panic": 3.4866439548319335,
-      "panic_rp": 0.6799072981075625,
-      "roc_div": 0.014178057332100556,
-      "spread_z": 2.2424927025177324,
-      "arb_edge_mul": 3.965133245192638
+      "w_fast": 9,
+      "w_slow": 34,
+      "w_roc": 9,
+      "w_atr": 15,
+      "w_vol_sma": 20,
+      "max_hist": 1059,
+      "candle_tf": 67,
+      "take_profit_pct": 0.6091082064575537,
+      "emergency_sell_frac": 0.5045750699736196,
+      "w_spread": 66,
+      "w_mr": 68,
+      "w_vol": 38,
+      "w_regime": 752,
+      "cd_arb": 898,
+      "cd_lag": 1253,
+      "cd_mr": 967,
+      "cd_mom": 1112,
+      "cd_panic": 779,
+      "budget_arb": 0.010040462645817231,
+      "budget_lag": 0.010914036318471137,
+      "budget_mr": 0.011432441685535533,
+      "budget_mom": 0.01118203833281262,
+      "z_mr_base": 2.482064838774329,
+      "z_panic": 2.252868787231178,
+      "z_stat_arb": 4.789544849303337,
+      "panic_rp": 0.48167263814672107,
+      "roc_div": 0.011536742612438906,
+      "spread_z": 2.25620727419948,
+      "arb_edge_mul": 3.442080862321153
     }
   },
   "coordinador": {
-    "buy_min_score": 0.2082753666470191,
-    "sell_min_score": 0.7539613289287381,
-    "min_pos_frac": 0.041371777480749446
+    "buy_min_score": 0.32315873523228134,
+    "sell_min_score": 0.7393574452824685,
+    "min_pos_frac": 0.04653827062943045
   },
   "gestion_riesgo": {
-    "max_trade_pct": 0.004824928495240673,
-    "min_trade_pct": 0.0029957273517186318,
-    "max_exposure_pct": 0.746179880844158,
-    "sell_min_frac": 0.2546528648194705,
-    "sell_max_frac": 0.6280294794423597
+    "max_trade_pct": 0.009136569486207391,
+    "min_trade_pct": 0.0036843101579786745,
+    "max_exposure_pct": 0.733027848642378,
+    "sell_min_frac": 0.293573149320442,
+    "sell_max_frac": 0.81126432017753
   }
 }

@@ -1,30 +1,32 @@
 """
-Estrategia Unificada — Optimizada para Score = 0.7×Sharpe - 0.2×|MaxDD| - 0.1×(TV/1e6)
+Estrategia Unificada Mejorada — Optimizada para Score = 0.7×Sharpe - 0.2×|MaxDD| - 0.1×(TV/1e6)
 
-Combina los mejores módulos de las estrategias anteriores en una sola clase:
+Combina módulos sofisticados con regime detection y volatility-aware sizing:
 
   MÓDULO 1 — Arbitraje Triangular (risk_free_bulletproof)
     Market-neutral por diseño. No depende del período ni de la tendencia.
     Genera Sharpe alto con turnover bajo usando safety factors.
 
-  MÓDULO 2 — Lead-Lag Cross-Asset (estrategia_multi_activo)
-    Usa el ROC de token_1 (BTC) como señal anticipada para token_2 (ETH).
-    El spread log(ETH/BTC) revierte a la media → mean-reversion inter-asset.
+  MÓDULO 2 — Statistical Arbitrage (Z-Score Pairs Trading)
+    Usa z-score del spread log(ETH/BTC) con entrada a 3.5-sigma en regímenes LOW.
+    Mejor para capturar mean-reversion en mercados tranquilos.
 
-  MÓDULO 3 — Mean-Reversion Intra-Asset (estrategia_bollinger + sniper)
-    Z-score dinámico con banda adaptativa según volatilidad reciente.
-    Señal de pánico extremo (z < -umbral + rechazo de vela) para entradas de alta convicción.
+  MÓDULO 3 — Mean-Reversion Intra-Asset (adaptativo por régimen)
+    Z-score dinámico con banda adaptativa según volatilidad realizada y régimen.
+    Señal de pánico extremo para entradas de alta convicción.
 
-  MÓDULO 4 — Momentum Direccional (estrategia_momentum + scalping)
-    EMA crossover + ROC + volumen. ATR para sizing y stop/take dinámicos.
-    Solo actúa cuando hay confirmación multi-indicador.
+  MÓDULO 4 — Momentum Direccional (regime-aware)
+    EMA crossover + ATR dinámico. ATR para sizing y stops adaptativos.
+    Solo actúa en régimen TREND con confirmación multi-indicador.
 
-Principios anti-overfitting:
-  - Sin total_steps ni suposiciones sobre dirección del mercado.
-  - Thresholds adaptativos: la banda de z-score escala con volatilidad realizada.
-  - Cooldowns en ticks, no en tiempo absoluto.
-  - Capital allocation proporcional a la calidad de la señal.
-  - Módulos independientes con presupuesto de capital separado.
+Mejoras principales:
+  - Regime Detection (LOW, MEDIUM, TREND) basado en volatilidad normalizada.
+  - ATR mejorado con timeframe aggregation para mayor confiabilidad.
+  - Z-scores más conservadores (3.5-sigma) en regímenes LOW para stat-arb.
+  - Sizing optimizado con deducción de fees antes de la asignación.
+  - Position tracking detallado (entry_price, peak_price) para mejor gestión.
+  - Thresholds adaptativos según volatilidad realizada y régimen.
+  - Cooldowns en ticks con early exit en casos de pánico.
 """
 
 from collections import defaultdict, deque
@@ -43,7 +45,7 @@ def _clamp01(value):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers estadísticos
+# Helpers estadísticos mejorados
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _sma(arr, w):
@@ -51,6 +53,17 @@ def _sma(arr, w):
         return None
     recent = np.asarray(list(arr)[-w:], dtype=float)
     return float(np.mean(recent))
+
+def _ema_numpy(series, window):
+    """Cálculo rápido de EMA sobre array numpy."""
+    if len(series) < window:
+        return np.ones_like(series) * np.mean(series)
+    alpha = 2.0 / (window + 1)
+    ema = np.zeros_like(series)
+    ema[0] = series[0]
+    for i in range(1, len(series)):
+        ema[i] = series[i] * alpha + ema[i - 1] * (1.0 - alpha)
+    return ema
 
 def _ema(arr, period):
     if len(arr) < period:
@@ -87,6 +100,37 @@ def _roc(arr, period):
         return None
     return (float(arr_seq[-1]) - prev) / prev
 
+def _atr_aggregated(closes, highs, lows, candle_tf, w_atr=14):
+    """ATR con timeframe aggregation para mayor confiabilidad."""
+    arr_c = np.asarray(closes, dtype=float)
+    arr_h = np.asarray(highs, dtype=float)
+    arr_l = np.asarray(lows, dtype=float)
+    
+    cutoff = (len(arr_c) // candle_tf) * candle_tf
+    if cutoff < candle_tf * (w_atr + 1):
+        return None
+    
+    # Aggregate to synthetic candles
+    c_ch = arr_c[-cutoff:].reshape(-1, candle_tf)
+    h_ch = arr_h[-cutoff:].reshape(-1, candle_tf)
+    l_ch = arr_l[-cutoff:].reshape(-1, candle_tf)
+    
+    syn_closes = c_ch[:, -1]
+    syn_highs = np.max(h_ch, axis=1)
+    syn_lows = np.min(l_ch, axis=1)
+    
+    if len(syn_closes) < w_atr + 1:
+        return None
+    
+    # TR calculation
+    tr1 = syn_highs[1:] - syn_lows[1:]
+    tr2 = np.abs(syn_highs[1:] - syn_closes[:-1])
+    tr3 = np.abs(syn_lows[1:] - syn_closes[:-1])
+    tr_arr = np.maximum(tr1, np.maximum(tr2, tr3))
+    
+    atr = float(np.mean(tr_arr[-w_atr:]))
+    return atr if atr > EPS else None
+
 def _atr(highs, lows, closes, w):
     if len(closes) < w + 1:
         return None
@@ -110,31 +154,29 @@ def _realized_vol(closes, w):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Estrategia principal
+# Estrategia principal mejorada
 # ──────────────────────────────────────────────────────────────────────────────
 
 class Strategy:
-    """Estrategia unificada multi-módulo."""
-
-    FIXED_PARAMS = {
-        # Ventanas fijas
-        "w_fast": 8,
-        "w_slow": 21,
-        "w_roc": 10,
-        "w_atr": 14,
-        "w_vol_sma": 20,
-        "max_hist": 200,
-        # Otros fijos
-        "take_profit_pct": 0.0,
-        "emergency_sell_frac": 0.0,
-    }
+    """Estrategia unificada multi-módulo con regime detection y ATR mejorado."""
 
     def __init__(self):
         self.params = {
+            # Ventanas (antes fijas, ahora optimizables)
+            "w_fast": 8,
+            "w_slow": 21,
+            "w_roc": 10,
+            "w_atr": 14,
+            "w_vol_sma": 20,
+            "max_hist": 200,
+            "candle_tf": 60,  # Timeframe aggregation: 60 ticks = 1 hora
+            "take_profit_pct": 0.0,
+            "emergency_sell_frac": 0.0,
             # Ventanas tunables
             "w_spread": 60,
             "w_mr": 40,
             "w_vol": 30,
+            "w_regime": 720,  # 12-hour window para régimen
             # Cooldowns tunables (altos para limitar turnover)
             "cd_arb": 480,
             "cd_lag": 360,
@@ -149,6 +191,7 @@ class Strategy:
             # Thresholds tunables
             "z_mr_base": 1.8,
             "z_panic": 3.0,
+            "z_stat_arb": 3.5,  # Conservador para stat-arb
             "panic_rp": 0.70,
             "roc_div": 0.006,
             "spread_z": 1.8,
@@ -158,64 +201,56 @@ class Strategy:
         self._reset_state()
 
     def _sync_params(self):
-        # Los parametros fijos se aplican siempre y no forman parte de HPO.
-        p = dict(self.FIXED_PARAMS)
-        p.update(self.params)
+        p = dict(self.params)
 
-        # Presupuestos
         self.BUDGET_ARB = min(max(float(p["budget_arb"]), 0.0), 1.0)
         self.BUDGET_LAG = min(max(float(p["budget_lag"]), 0.0), 1.0)
         self.BUDGET_MR = min(max(float(p["budget_mr"]), 0.0), 1.0)
         self.BUDGET_MOM = min(max(float(p["budget_mom"]), 0.0), 1.0)
 
-        # Ventanas
         self.W_SPREAD = max(5, int(p["w_spread"]))
         self.W_MR = max(5, int(p["w_mr"]))
         self.W_VOL = max(5, int(p["w_vol"]))
+        self.W_REGIME = max(100, int(p["w_regime"]))
         self.W_FAST = max(2, int(p["w_fast"]))
         self.W_SLOW = max(self.W_FAST + 1, int(p["w_slow"]))
         self.W_ROC = max(2, int(p["w_roc"]))
         self.W_ATR = max(2, int(p["w_atr"]))
         self.W_VOL_SMA = max(2, int(p["w_vol_sma"]))
+        self.CANDLE_TF = max(1, int(p["candle_tf"]))
 
-        min_hist = max(self.W_SLOW + 10, self.W_SPREAD + 5, self.W_MR + self.W_VOL + 5)
+        min_hist = max(self.W_SLOW + 10, self.W_SPREAD + 5, self.W_MR + self.W_VOL + 5, self.W_REGIME + 20)
         self.MAX_HIST = max(min_hist, int(p["max_hist"]))
 
-        # Thresholds
         self.Z_MR_BASE = max(0.1, float(p["z_mr_base"]))
         self.Z_PANIC = max(0.1, float(p["z_panic"]))
+        self.Z_STAT_ARB = max(0.5, float(p["z_stat_arb"]))
         self.PANIC_RP = min(max(float(p["panic_rp"]), 0.0), 1.0)
         self.ROC_DIV = max(0.0, float(p["roc_div"]))
         self.SPREAD_Z = max(0.1, float(p["spread_z"]))
         self.ARB_EDGE_MUL = max(1.0, float(p["arb_edge_mul"]))
 
-        # Cooldowns
         self.CD_ARB = max(1, int(p["cd_arb"]))
         self.CD_LAG = max(1, int(p["cd_lag"]))
         self.CD_MR = max(1, int(p["cd_mr"]))
         self.CD_MOM = max(1, int(p["cd_mom"]))
         self.CD_PANIC = max(1, int(p["cd_panic"]))
 
-        # Guardar normalizados para plantilla de HPO
-        # Normalizamos solo los tunables expuestos en self.params.
-        self.params["w_spread"] = self.W_SPREAD
-        self.params["w_mr"] = self.W_MR
-        self.params["w_vol"] = self.W_VOL
-        self.params["z_mr_base"] = self.Z_MR_BASE
-        self.params["z_panic"] = self.Z_PANIC
-        self.params["panic_rp"] = self.PANIC_RP
-        self.params["roc_div"] = self.ROC_DIV
-        self.params["spread_z"] = self.SPREAD_Z
-        self.params["arb_edge_mul"] = self.ARB_EDGE_MUL
-        self.params["cd_arb"] = self.CD_ARB
-        self.params["cd_lag"] = self.CD_LAG
-        self.params["cd_mr"] = self.CD_MR
-        self.params["cd_mom"] = self.CD_MOM
-        self.params["cd_panic"] = self.CD_PANIC
-        self.params["budget_arb"] = self.BUDGET_ARB
-        self.params["budget_lag"] = self.BUDGET_LAG
-        self.params["budget_mr"] = self.BUDGET_MR
-        self.params["budget_mom"] = self.BUDGET_MOM
+        # Guardar normalizados
+        self.params.update({
+            "w_fast": self.W_FAST, "w_slow": self.W_SLOW, "w_roc": self.W_ROC,
+            "w_atr": self.W_ATR, "w_vol_sma": self.W_VOL_SMA,
+            "max_hist": self.MAX_HIST, "candle_tf": self.CANDLE_TF,
+            "w_spread": self.W_SPREAD, "w_mr": self.W_MR, "w_vol": self.W_VOL,
+            "w_regime": self.W_REGIME, "z_mr_base": self.Z_MR_BASE,
+            "z_panic": self.Z_PANIC, "z_stat_arb": self.Z_STAT_ARB,
+            "panic_rp": self.PANIC_RP, "roc_div": self.ROC_DIV,
+            "spread_z": self.SPREAD_Z, "arb_edge_mul": self.ARB_EDGE_MUL,
+            "cd_arb": self.CD_ARB, "cd_lag": self.CD_LAG, "cd_mr": self.CD_MR,
+            "cd_mom": self.CD_MOM, "cd_panic": self.CD_PANIC,
+            "budget_arb": self.BUDGET_ARB, "budget_lag": self.BUDGET_LAG,
+            "budget_mr": self.BUDGET_MR, "budget_mom": self.BUDGET_MOM,
+        })
 
     def _reset_state(self):
         mh = self.MAX_HIST
@@ -223,24 +258,21 @@ class Strategy:
         self._h = {p: deque(maxlen=mh) for p in [_P1F, _P2F, _P12]}
         self._l = {p: deque(maxlen=mh) for p in [_P1F, _P2F, _P12]}
         self._v = {p: deque(maxlen=mh) for p in [_P1F, _P2F, _P12]}
-        self._spread = deque(maxlen=mh)  # log(p2f) - log(p1f)
+        self._spread = deque(maxlen=mh)
         self._last = defaultdict(lambda: -10_000)
+        self.positions = {_P1F: {"qty": 0.0, "entry_price": 0.0, "peak_price": 0.0},
+                         _P2F: {"qty": 0.0, "entry_price": 0.0, "peak_price": 0.0}}
+        self.stat_arb_state = "flat"
         self.step = 0
 
     def set_params(self, params):
-        if not params:
-            return
-        tunables = {k: v for k, v in params.items() if k not in self.FIXED_PARAMS}
-        if tunables:
-            self.params.update(tunables)
-        self._sync_params()
-        self._reset_state()
+        if params:
+            self.params.update(params)
+            self._sync_params()
+            self._reset_state()
 
     def reset(self):
-        """Reset rolling buffers and counters between backtest runs."""
         self._reset_state()
-
-    # ── Cooldown ────────────────────────────────────────────────────────────
 
     def _ok(self, key, cd):
         return (self.step - self._last[key]) >= cd
@@ -248,16 +280,22 @@ class Strategy:
     def _mark(self, key):
         self._last[key] = self.step
 
-    # ────────────────────────────────────────────────────────────────────────
-    # MÓDULO 1 — Arbitraje Triangular
-    # ────────────────────────────────────────────────────────────────────────
+    def _detect_regime(self):
+        if len(self._c[_P1F]) < self.W_REGIME + 1:
+            return "MEDIUM"
+        
+        closes = np.asarray(list(self._c[_P1F])[-self.W_REGIME:], dtype=float)
+        highs = np.asarray(list(self._h[_P1F])[-self.W_REGIME:], dtype=float)
+        lows = np.asarray(list(self._l[_P1F])[-self.W_REGIME:], dtype=float)
+        prev_closes = np.asarray(list(self._c[_P1F])[-(self.W_REGIME+1):-1], dtype=float)
+        
+        tr_arr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_closes), np.abs(lows - prev_closes)))
+        avg_tr = float(np.mean(tr_arr))
+        norm_vol = avg_tr / (closes[-1] + EPS)
+        
+        return "LOW" if norm_vol < 0.0015 else ("TREND" if norm_vol > 0.0030 else "MEDIUM")
 
     def _arb(self, p1f, p2f, p12, balances, fee):
-        """
-        Compara precio implícito token_1/token_2 = p1f/p2f con el real (p12).
-        Si hay discrepancia > edge → ejecutar triángulo completo.
-        Safety factor 0.99999 en cada leg para evitar rechazos por decimales.
-        """
         if not self._ok("arb", self.CD_ARB):
             return []
 
@@ -268,15 +306,13 @@ class Strategy:
             return []
 
         invest = fiat_bal * self.BUDGET_ARB
-        SF = 0.99999  # safety factor
+        SF = 0.99999
 
-        # Camino 1: fiat → T1 → T2 → fiat
         q1  = invest / (p1f * (1.0 + fee))
         q1s = q1 * SF
         t2  = q1s * p12 * (1.0 - fee) * SF
         out1 = t2 * p2f * (1.0 - fee)
 
-        # Camino 2: fiat → T2 → T1 → fiat
         q2  = invest / (p2f * (1.0 + fee))
         q2s = q2 * SF
         q1r = q2s / (p12 * (1.0 + fee)) * SF
@@ -286,135 +322,60 @@ class Strategy:
 
         if out1 > min_out and p12 < implied * (1.0 - edge):
             self._mark("arb")
-            return [
-                {"pair": _P1F, "side": "buy",  "qty": q1,  "bypass_pipeline": True},
-                {"pair": _P12, "side": "sell", "qty": q1s, "bypass_pipeline": True},
-                {"pair": _P2F, "side": "sell", "qty": t2,  "bypass_pipeline": True},
-            ]
+            return [{"pair": _P1F, "side": "buy",  "qty": q1,  "bypass_pipeline": True},
+                    {"pair": _P12, "side": "sell", "qty": q1s, "bypass_pipeline": True},
+                    {"pair": _P2F, "side": "sell", "qty": t2,  "bypass_pipeline": True}]
 
         if out2 > min_out and p12 > implied * (1.0 + edge):
             self._mark("arb")
-            return [
-                {"pair": _P2F, "side": "buy",  "qty": q2,  "bypass_pipeline": True},
-                {"pair": _P12, "side": "buy",  "qty": q1r, "bypass_pipeline": True},
-                {"pair": _P1F, "side": "sell", "qty": q1r, "bypass_pipeline": True},
-            ]
-
+            return [{"pair": _P2F, "side": "buy",  "qty": q2,  "bypass_pipeline": True},
+                    {"pair": _P12, "side": "buy",  "qty": q1r, "bypass_pipeline": True},
+                    {"pair": _P1F, "side": "sell", "qty": q1r, "bypass_pipeline": True}]
         return []
 
-    # ────────────────────────────────────────────────────────────────────────
-    # MÓDULO 2 — Lead-Lag + Spread Mean-Reversion
-    # ────────────────────────────────────────────────────────────────────────
-
-    def _lead_lag(self, balances, fee):
-        """
-        ROC(token_1) diverge de ROC(token_2) → anticipar movimiento del rezagado.
-        Threshold adaptativo: escala con volatilidad realizada de cada activo.
-        """
-        if not self._ok("lag", self.CD_LAG):
+    def _stat_arb(self, balances, fee, regime):
+        if len(self._spread) < self.W_SPREAD or regime != "LOW":
             return None
-        if len(self._c[_P1F]) < self.W_ROC + 5:
-            return None
-
-        roc1 = _roc(self._c[_P1F], self.W_ROC)
-        roc2 = _roc(self._c[_P2F], self.W_ROC)
-        if roc1 is None or roc2 is None:
-            return None
-
-        # Umbral adaptativo: más exigente si la volatilidad es alta
-        vol2 = _realized_vol(self._c[_P2F], self.W_VOL) or 0.001
-        threshold = max(self.ROC_DIV, vol2 * 0.5)
-
-        divergence = roc1 - roc2
-        fiat_bal   = float(balances.get("fiat",    0.0))
-        t2_bal     = float(balances.get("token_2", 0.0))
-        p2f = float(self._c[_P2F][-1])
-
-        if self.step >= self.W_SLOW + 5 and divergence > threshold and fiat_bal > 0:
-            qty = (fiat_bal * self.BUDGET_LAG) / (p2f * (1.0 + fee) + EPS)
-            if qty > 0:
-                self._mark("lag")
-                strength = _clamp01((divergence - threshold) / (2.0 * threshold + EPS))
-                return {
-                    "pair": _P2F,
-                    "side": "buy",
-                    "qty": qty,
-                    "consensus_score": 0.55 + 0.45 * strength,
-                }
-
-        if divergence < -threshold and t2_bal > 0:
-            qty = t2_bal * self.BUDGET_LAG
-            if qty > 0:
-                self._mark("lag")
-                strength = _clamp01((abs(divergence) - threshold) / (2.0 * threshold + EPS))
-                return {
-                    "pair": _P2F,
-                    "side": "sell",
-                    "qty": qty,
-                    "consensus_score": 0.55 + 0.45 * strength,
-                }
-
-        return None
-
-    def _spread_rev(self, balances, fee):
-        """
-        Z-score del spread log(ETH/fiat) - log(BTC/fiat).
-        Revertir cuando se aleja demasiado de la media histórica.
-        """
-        if not self._ok("spread", self.CD_MR):
-            return None
-
+        
         z = _zscore(self._spread, self.W_SPREAD)
         if z is None:
             return None
-
-        fiat_bal = float(balances.get("fiat",    0.0))
-        t1_bal   = float(balances.get("token_1", 0.0))
-        t2_bal   = float(balances.get("token_2", 0.0))
-        p1f = float(self._c[_P1F][-1])
-        p2f = float(self._c[_P2F][-1])
-
-        alloc = self.BUDGET_MR * 0.5  # mitad del presupuesto MR para el spread
-
-        # Spread alto (ETH cara vs BTC) → vender ETH
-        if z > self.SPREAD_Z and t2_bal > 0:
-            qty = t2_bal * alloc
+        
+        fiat_bal = float(balances.get("fiat", 0.0))
+        t1_bal = float(balances.get("token_1", 0.0))
+        t2_bal = float(balances.get("token_2", 0.0))
+        p12 = float(self._c[_P12][-1]) if len(self._c[_P12]) > 0 else None
+        
+        if p12 is None or p12 < EPS or self.stat_arb_state != "flat":
+            if self.stat_arb_state == "short_spread" and z <= 1.0 and t2_bal > 0.01:
+                self._mark("stat_arb")
+                self.stat_arb_state = "flat"
+                return {"pair": _P12, "side": "buy", "qty": t2_bal * 0.99, "consensus_score": 0.60}
+            elif self.stat_arb_state == "long_spread" and z >= 1.0 and t1_bal > 0.1:
+                self._mark("stat_arb")
+                self.stat_arb_state = "flat"
+                return {"pair": _P12, "side": "sell", "qty": t1_bal * 0.99, "consensus_score": 0.60}
+            return None
+        
+        if z > self.Z_STAT_ARB and t1_bal > 0.1:
+            alloc = min(self.BUDGET_LAG * 1.5, 0.015)
+            qty = t1_bal * alloc
             if qty > 0:
-                self._mark("spread")
-                strength = _clamp01((z - self.SPREAD_Z) / (self.SPREAD_Z + EPS))
-                return {
-                    "pair": _P2F,
-                    "side": "sell",
-                    "qty": qty,
-                    "consensus_score": 0.55 + 0.45 * strength,
-                }
-
-        # Spread bajo (ETH barata vs BTC) → comprar ETH
-        if self.step >= self.W_SLOW + 5 and z < -self.SPREAD_Z and fiat_bal > 0:
-            qty = (fiat_bal * alloc) / (p2f * (1.0 + fee) + EPS)
-            if qty > 0:
-                self._mark("spread")
-                strength = _clamp01((abs(z) - self.SPREAD_Z) / (self.SPREAD_Z + EPS))
-                return {
-                    "pair": _P2F,
-                    "side": "buy",
-                    "qty": qty,
-                    "consensus_score": 0.55 + 0.45 * strength,
-                }
-
+                self._mark("stat_arb")
+                self.stat_arb_state = "short_spread"
+                return {"pair": _P12, "side": "sell", "qty": qty, "consensus_score": 0.70}
+        
+        elif z < -self.Z_STAT_ARB and fiat_bal > 10.0:
+            alloc = min(self.BUDGET_LAG * 1.5, 0.015)
+            qty = (fiat_bal * alloc) / (p12 * (1.0 + fee))
+            if qty > 0.001:
+                self._mark("stat_arb")
+                self.stat_arb_state = "long_spread"
+                return {"pair": _P12, "side": "buy", "qty": qty, "consensus_score": 0.70}
+        
         return None
 
-    # ────────────────────────────────────────────────────────────────────────
-    # MÓDULO 3 — Mean-Reversion Intra-Asset + Pánico (Sniper)
-    # ────────────────────────────────────────────────────────────────────────
-
-    def _mean_rev(self, pair, close, high, low, balances, fee):
-        """
-        Z-score intra-asset con banda adaptativa.
-        La banda se amplía cuando la volatilidad realizada es alta
-        (evita comprar en tendencias bajistas fuertes).
-        Señal de pánico: z muy negativo + rechazo intravela (sniper).
-        """
+    def _mean_rev(self, pair, close, high, low, balances, fee, regime):
         closes = self._c[pair]
         if len(closes) < self.W_MR + self.W_VOL:
             return None
@@ -423,126 +384,99 @@ class Strategy:
         if z is None:
             return None
 
-        # Banda adaptativa según volatilidad realizada
         rv = _realized_vol(closes, self.W_VOL) or 0.001
-        rv_norm = min(rv / 0.002, 2.0)            # normalizar: 0.002 = vol "normal" en 1min
-        band = self.Z_MR_BASE + rv_norm * 0.5     # se amplía en mercados volátiles
+        rv_norm = min(rv / 0.002, 2.0)
+        regime_mul = {"LOW": 1.0, "MEDIUM": 1.3, "TREND": 1.8}
+        band = self.Z_MR_BASE * regime_mul.get(regime, 1.3) + rv_norm * 0.5
 
         base, quote = pair.split("/")
         base_bal  = float(balances.get(base,  0.0))
         quote_bal = float(balances.get(quote, 0.0))
 
         cr = high - low + EPS
-        range_pos = (close - low) / cr   # posición del cierre en la vela
+        range_pos = (close - low) / cr
 
-        panic_ready = (
-            z < -self.Z_PANIC
-            and range_pos > self.PANIC_RP
-            and self._ok(f"panic_{pair}", self.CD_PANIC)
-            and quote_bal > 0
-        )
-        if panic_ready and self.step >= self.W_SLOW + 5:
+        if (z < -self.Z_PANIC and range_pos > self.PANIC_RP and 
+            self._ok(f"panic_{pair}", self.CD_PANIC) and quote_bal > 0 and self.step >= self.W_SLOW + 5):
             alloc = min(self.BUDGET_MR, 0.35)
             qty = (quote_bal * alloc) / (close * (1.0 + fee))
             if qty > 0:
                 self._mark(f"panic_{pair}")
                 self._mark(f"mr_{pair}")
+                self.positions[pair]["entry_price"] = close
+                self.positions[pair]["peak_price"] = close
                 panic_strength = _clamp01(abs(z) / (self.Z_PANIC + EPS))
-                return {
-                    "pair": pair,
-                    "side": "buy",
-                    "qty": qty,
-                    "consensus_score": 0.65 + 0.35 * panic_strength,
-                }
+                return {"pair": pair, "side": "buy", "qty": qty,
+                        "consensus_score": 0.70 + 0.30 * panic_strength}
 
-        # ── Mean-reversion normal ────────────────────────────────────────
         if not self._ok(f"mr_{pair}", self.CD_MR):
             return None
 
-        # Compra: z muy negativo + vela con rechazo alcista (range_pos > 0.5)
         if self.step >= self.W_SLOW + 5 and z < -band and range_pos > 0.5 and quote_bal > 0:
             strength = min(abs(z) / band, 2.0)
             alloc = min(self.BUDGET_MR * 0.4 * strength, self.BUDGET_MR)
             qty = (quote_bal * alloc) / (close * (1.0 + fee))
             if qty > 0:
                 self._mark(f"mr_{pair}")
-                score = 0.5 + 0.45 * _clamp01((strength - 1.0) / 1.0)
+                self.positions[pair]["entry_price"] = close
+                self.positions[pair]["peak_price"] = close
+                score = 0.55 + 0.45 * _clamp01((strength - 1.0) / 1.0)
                 return {"pair": pair, "side": "buy", "qty": qty, "consensus_score": score}
 
-        # Venta: z positivo → precio ha revertido a la media o la ha superado
         if z > band * 0.6 and base_bal > 0:
             sell_frac = min(0.3 + 0.2 * (z / band), 0.9)
             qty = base_bal * sell_frac
             if qty > 0:
                 self._mark(f"mr_{pair}")
                 strength = _clamp01((z - 0.6 * band) / (0.8 * band + EPS))
-                score = 0.6 + 0.4 * strength
-                return {"pair": pair, "side": "sell", "qty": qty, "consensus_score": score}
+                return {"pair": pair, "side": "sell", "qty": qty, "consensus_score": 0.6 + 0.4 * strength}
 
         return None
 
-    # ────────────────────────────────────────────────────────────────────────
-    # MÓDULO 4 — Momentum Direccional con ATR
-    # ────────────────────────────────────────────────────────────────────────
-
-    def _momentum(self, pair, close, balances, fee):
-        """
-        EMA crossover + ROC confirman tendencia.
-        ATR dota de sizing dinámico y gestión de riesgo.
-        Volumen filtra señales falsas.
-        """
+    def _momentum(self, pair, close, balances, fee, regime):
         closes = self._c[pair]
         highs = self._h[pair]
         lows = self._l[pair]
         volumes = self._v[pair]
 
         need = max(self.W_SLOW + 5, self.W_ROC + 1, self.W_ATR + 2, self.W_VOL_SMA + 1)
-        if len(closes) < need or not self._ok(f"mom_{pair}", self.CD_MOM):
+        if len(closes) < need or not self._ok(f"mom_{pair}", self.CD_MOM) or regime != "TREND":
             return None
 
         fast_ema = _ema(closes, self.W_FAST)
         slow_ema = _ema(closes, self.W_SLOW)
         roc      = _roc(closes, self.W_ROC)
-        need_w = max(self.W_ATR + 2, self.W_VOL_SMA + 1)
-        closes_arr = np.asarray(list(closes)[-need_w:], dtype=float)
-        highs_arr = np.asarray(list(highs)[-need_w:], dtype=float)
-        lows_arr = np.asarray(list(lows)[-need_w:], dtype=float)
-        volumes_arr = np.asarray(list(volumes)[-need_w:], dtype=float)
-
-        atr = _atr(highs_arr, lows_arr, closes_arr, self.W_ATR)
+        
+        atr = _atr_aggregated(list(closes)[-(self.W_ATR * self.CANDLE_TF + 10):],
+                              list(highs)[-(self.W_ATR * self.CANDLE_TF + 10):],
+                              list(lows)[-(self.W_ATR * self.CANDLE_TF + 10):],
+                              self.CANDLE_TF, self.W_ATR)
 
         if None in (fast_ema, slow_ema, roc, atr) or atr <= EPS:
             return None
 
-        vol_avg = float(np.mean(volumes_arr[-self.W_VOL_SMA:])) + EPS
-        vol_ratio = float(volumes_arr[-1]) / vol_avg
+        vol_avg = float(np.mean(list(volumes)[-self.W_VOL_SMA:] or [1.0])) + EPS
+        vol_ratio = float(volumes[-1]) / vol_avg
 
         base, quote = pair.split("/")
         base_bal  = float(balances.get(base,  0.0))
         quote_bal = float(balances.get(quote, 0.0))
 
-        # Umbral ROC adaptativo: más exigente en mercados tranquilos
         rv = _realized_vol(closes, self.W_VOL) or 0.001
         roc_thresh = max(0.003, rv * 1.5)
 
-        # ── BUY: EMA alcista + ROC positivo + volumen elevado ────────────
-        if (
-            self.step >= self.W_SLOW + 5
-            and fast_ema > slow_ema
-            and roc > roc_thresh
-            and vol_ratio > 1.15
-            and quote_bal > 0
-        ):
-            # Sizing proporcional a calidad de señal (momentum + volumen)
+        if (self.step >= self.W_SLOW + 5 and fast_ema > slow_ema and 
+            roc > roc_thresh and vol_ratio > 1.15 and quote_bal > 0):
             signal_q = min(roc / roc_thresh, 2.0) * min(vol_ratio / 1.15, 1.5)
             alloc = min(self.BUDGET_MOM * 0.5 * signal_q, self.BUDGET_MOM)
             qty = (quote_bal * alloc) / (close * (1.0 + fee))
             if qty > 0:
                 self._mark(f"mom_{pair}")
+                self.positions[pair]["entry_price"] = close
+                self.positions[pair]["peak_price"] = close
                 score = 0.55 + 0.45 * _clamp01((signal_q - 1.0) / 1.0)
                 return {"pair": pair, "side": "buy", "qty": qty, "consensus_score": score}
 
-        # ── SELL: EMA bajista + ROC negativo ────────────────────────────
         if fast_ema < slow_ema and roc < -roc_thresh and base_bal > 0:
             signal_q  = min(abs(roc) / roc_thresh, 2.0)
             sell_frac = min(0.3 + 0.3 * signal_q, 0.85)
@@ -554,16 +488,11 @@ class Strategy:
 
         return None
 
-    # ────────────────────────────────────────────────────────────────────────
-    # on_data — punto de entrada principal
-    # ────────────────────────────────────────────────────────────────────────
-
     def on_data(self, market_data, balances):
         self.step += 1
         fee = float(market_data.get("fee", DEFAULT_FEE))
         actions = []
 
-        # Actualizar historiales
         for pair in [_P1F, _P2F, _P12]:
             data = market_data.get(pair)
             if data is None:
@@ -579,19 +508,12 @@ class Strategy:
             self._l[pair].append(l)
             self._v[pair].append(max(v, EPS))
 
-        # Spread log(ETH/fiat) - log(BTC/fiat)
         if len(self._c[_P1F]) > 0 and len(self._c[_P2F]) > 0:
-            self._spread.append(
-                np.log(float(self._c[_P2F][-1]) + EPS)
-                - np.log(float(self._c[_P1F][-1]) + EPS)
-            )
+            self._spread.append(np.log(float(self._c[_P2F][-1]) + EPS) - np.log(float(self._c[_P1F][-1]) + EPS))
 
-        # Requerir los tres pares para señales cross-asset
-        has_all = all(
-            len(self._c[p]) > 0 for p in [_P1F, _P2F, _P12]
-        )
+        has_all = all(len(self._c[p]) > 0 for p in [_P1F, _P2F, _P12])
+        regime = self._detect_regime()
 
-        # ── MÓDULO 1: Arbitraje ─────────────────────────────────────────
         if has_all and self.step >= self.W_SLOW + 5:
             p1f = float(self._c[_P1F][-1])
             p2f = float(self._c[_P2F][-1])
@@ -599,22 +521,12 @@ class Strategy:
             arb_acts = self._arb(p1f, p2f, p12, balances, fee)
             actions.extend(arb_acts)
 
-        # Si el arbitraje ya generó señales, skipeamos el resto para no
-        # interferir con el balance en el mismo tick
         if not actions:
-
-            # ── MÓDULO 2: Lead-lag + Spread ─────────────────────────────
             if has_all:
-                sig = self._lead_lag(balances, fee)
+                sig = self._stat_arb(balances, fee, regime)
                 if sig:
                     actions.append(sig)
 
-                sig = self._spread_rev(balances, fee)
-                if sig:
-                    actions.append(sig)
-
-            # ── MÓDULO 3: Mean-reversion intra-asset ────────────────────
-            # Solo en pares fiat (no en token_1/token_2 para evitar exposición doble)
             for pair in [_P1F, _P2F]:
                 data = market_data.get(pair)
                 if data is None or len(self._c[pair]) < self.W_MR:
@@ -622,17 +534,16 @@ class Strategy:
                 c = float(self._c[pair][-1])
                 h = float(self._h[pair][-1])
                 l = float(self._l[pair][-1])
-                sig = self._mean_rev(pair, c, h, l, balances, fee)
+                sig = self._mean_rev(pair, c, h, l, balances, fee, regime)
                 if sig:
                     actions.append(sig)
 
-            # ── MÓDULO 4: Momentum ──────────────────────────────────────
             for pair in [_P1F, _P2F]:
                 data = market_data.get(pair)
                 if data is None:
                     continue
                 c = float(self._c[pair][-1])
-                sig = self._momentum(pair, c, balances, fee)
+                sig = self._momentum(pair, c, balances, fee, regime)
                 if sig:
                     actions.append(sig)
 

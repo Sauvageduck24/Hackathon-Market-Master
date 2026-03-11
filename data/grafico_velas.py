@@ -10,7 +10,7 @@ from matplotlib.patches import Rectangle
 from tqdm import tqdm
 
 
-DAYS_TO_PLOT = 1
+DAYS_TO_PLOT = 10
 
 
 def load_data(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
